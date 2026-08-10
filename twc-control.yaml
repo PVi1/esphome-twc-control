@@ -1,0 +1,774 @@
+substitutions:
+  device_name: "twc-control"
+  friendly_name: "TWC Charge Control"
+
+  # --- RS485 wiring (Waveshare ESP32-S3-RS485-CAN) ---
+  tx_pin: GPIO17
+  rx_pin: GPIO18
+  flow_control_pin: GPIO21
+  baud_rate: "115200"
+
+  # --- Calibration -- TWO different breakers, do not mix them up! Live in
+  #     secrets.yaml -- the exact amperage of your installation's breakers
+  #     is site-specific info, kept out of the published config. ---
+  # TWC sub-circuit breaker / internal limit set in the Tesla installer menu
+  # for TWC3 (Home Load Management) -- must match exactly, otherwise the
+  # limit will be offset.
+  twc_breaker_limit_a: !secret twc_breaker_limit_a
+  # Main incomer breaker (the one measured by the Shelly Pro 3EM on the main
+  # feed). Can be higher than twc_breaker_limit_a -- the car will be limited
+  # by whichever of the two is lower.
+  main_breaker_limit_a: !secret main_breaker_limit_a
+
+  # --- Real per-phase current/power (Shelly Pro 3EM on the main incomer,
+  #     measures EVERYTHING including the TWC branch), mirrored in from HA
+  #     entities -- see the "sensor: platform: homeassistant" block below.
+  #     HA is a hard dependency for this: if the API connection or the HA
+  #     entities go stale, we fail safe (see recompute_ct). ---
+  # HA-mirrored sensors only push a new value when HA itself sees one
+  # (Shelly's own rate-limiting/threshold in its HA integration), NOT on a
+  # fixed 1s cadence like the old direct-HTTP-poll design -- 5000ms was too
+  # tight and caused shelly_data_fresh to flap. 15s gives real headroom
+  # while still catching an actually-dead link reasonably fast.
+  shelly_stale_timeout_ms: "15000"    # no fresh data -> fail-safe
+  recompute_interval: "1000ms"        # periodic safety-net recompute, independent of HA pushes
+
+  # HA entity IDs (live in secrets.yaml, not published -- entity IDs can
+  # reveal LAN/device naming and household setup)
+  ha_current_a_entity: !secret ha_current_a_entity
+  ha_current_b_entity: !secret ha_current_b_entity
+  ha_current_c_entity: !secret ha_current_c_entity
+  ha_power_a_entity: !secret ha_power_a_entity
+  ha_power_b_entity: !secret ha_power_b_entity
+  ha_power_c_entity: !secret ha_power_c_entity
+  ha_charge_from_grid_entity: !secret ha_charge_from_grid_entity
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2025.6.0
+
+# USB-C is used for logs/flashing (native USB), RS485 runs on a separate UART1 (GPIO17/18) -> logger doesn't conflict
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  # Watchdog: without an HA connection we can't trust the mirrored
+  # charge_from_grid either (it could be a stale value) -> fail-safe to 0A.
+  on_client_disconnected:
+    - lambda: |-
+        ESP_LOGW("watchdog", "API client '%s' disconnected, fail-safe to 0A", client_info.c_str());
+        id(ha_api_connected) = false;
+    - script.execute: recompute_ct
+  on_client_connected:
+    - lambda: |-
+        id(ha_api_connected) = true;
+    - logger.log:
+        format: "API client '%s' connected from %s"
+        args: ["client_info.c_str()", "client_address.c_str()"]
+    - script.execute: recompute_ct
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Fallback AP in case it fails to connect -> you can still reach it to reflash/fix it
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+globals:
+  - id: ha_api_connected
+    type: bool
+    restore_value: no
+    initial_value: "false"      # safe startup: 0A available until HA confirms the connection
+
+  - id: ct1_current_a
+    type: float
+    initial_value: "${twc_breaker_limit_a}"   # on boot, report full consumption = no current available
+  - id: ct2_current_a
+    type: float
+    initial_value: "${twc_breaker_limit_a}"
+  - id: ct3_current_a
+    type: float
+    initial_value: "${twc_breaker_limit_a}"
+  - id: ct4_current_a
+    type: float
+    initial_value: "0.0"
+  - id: ct_total_a
+    type: float
+    initial_value: "0.0"
+
+  - id: ct1_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct2_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct3_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct4_power_w
+    type: float
+    initial_value: "0.0"
+  - id: ct_total_w
+    type: float
+    initial_value: "0.0"
+
+  # --- TWC3 polling diagnostics (hooked into reading register 0xF4, the
+  #     main register TWC3 actually uses to decide the limit) ---
+  - id: last_poll_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: poll_interval_ms
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  # --- Escalation timer: how long "reported" has been pinned at the full
+  #     breaker limit (0A available) on all 3 phases without a break, see
+  #     the escalation block in recompute_ct below. 0 = not currently capped. ---
+  - id: capped_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # --- Real per-phase current/power (Shelly Pro 3EM on the main incomer,
+  #     includes the TWC branch too), mirrored in from HA entities --
+  #     see "sensor: platform: homeassistant" below. ---
+  - id: shelly_a_current
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: shelly_b_current
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: shelly_c_current
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  # act_power: negative = export to grid, positive = import from grid (straight from Shelly)
+  - id: shelly_a_power
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: shelly_b_power
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: shelly_c_power
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  # last time ANY of the 6 HA-mirrored sensors above pushed a fresh value
+  - id: shelly_last_ok_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"          # 0 = no valid response has ever arrived yet -> fail-safe
+
+# ---------------------------------------------------------------------------
+# Two breakers protected at once -- the TWC sub-breaker (twc_breaker_limit_a)
+# and the main incomer breaker (main_breaker_limit_a), both measured and
+# protected simultaneously through a single "avail".
+#
+# IMPORTANT: TWC3 internally compares "reported" against ITS OWN configured
+# limit (twc_breaker_limit_a, e.g. 16A) -- that is the only "breaker" TWC
+# knows about. To also protect the (higher) main breaker through this same
+# channel, we have to cap availability upfront to whichever of the two is
+# lower:
+#
+#   avail_main = main_breaker_limit_a - real   (protects the main breaker)
+#   avail_mode = grid_mode ? twc_breaker_limit_a : -signed_current
+#   avail      = min(avail_mode, twc_breaker_limit_a, avail_main)
+#   reported   = twc_breaker_limit_a - avail
+#
+# GRID mode (charge_from_grid = ON): the car gets the max allowed by
+# whichever breaker is lower (normally twc_breaker_limit_a, unless the main
+# breaker is otherwise loaded).
+#
+# FVE-only mode (charge_from_grid = OFF, "FVE" = PV/solar-only): a
+# self-balancing loop toward zero grid exchange (avail_mode =
+# -signed_current, export=negative/import=positive per act_power), still
+# bounded by both breakers.
+#
+# avail is clamped against both breakers AND floored at 0, so "reported"
+# never exceeds twc_breaker_limit_a even under overload/import -- testing
+# whether TWC3 reacts better to a hard cap at "0 available" than to values
+# above its own configured limit.
+#
+# If the HA charge_from_grid entity doesn't have a valid state yet, we
+# safely fall back to GRID mode (more conservative, proven to work).
+#
+# Fail-safe: if the Shelly data isn't fresh (> shelly_stale_timeout_ms) OR
+# the HA API isn't connected (can't trust the mirrored charge_from_grid),
+# report full consumption (twc_breaker_limit_a) on all phases = 0A for the car.
+# ---------------------------------------------------------------------------
+script:
+  - id: recompute_ct
+    then:
+      - lambda: |-
+          const float twc_breaker = ${twc_breaker_limit_a};
+          const float main_breaker = ${main_breaker_limit_a};
+          const float voltage = 230.0f;
+
+          bool shelly_stale = (id(shelly_last_ok_ms) == 0) ||
+              (millis() - id(shelly_last_ok_ms) > (uint32_t)${shelly_stale_timeout_ms});
+
+          bool grid_mode = true;
+          if (id(charge_from_grid).has_state()) {
+            grid_mode = id(charge_from_grid).state;
+          }
+
+          float reported_a, reported_b, reported_c;
+          if (shelly_stale || !id(ha_api_connected)) {
+            ESP_LOGW("shelly", "Shelly stale or HA API disconnected, fail-safe to 0A");
+            reported_a = reported_b = reported_c = twc_breaker;
+          } else {
+            float real_a = id(shelly_a_current);
+            float real_b = id(shelly_b_current);
+            float real_c = id(shelly_c_current);
+
+            float avail_mode_a, avail_mode_b, avail_mode_c;
+            if (grid_mode) {
+              avail_mode_a = twc_breaker;
+              avail_mode_b = twc_breaker;
+              avail_mode_c = twc_breaker;
+            } else if (id(aggregate_balance_metering).state) {
+              // Aggregate/net metering: your utility nets import/export
+              // across all 3 phases together for billing. TWC3 applies a
+              // SINGLE current to all connected phases and is bottlenecked
+              // by whichever phase's register shows the least availability
+              // -- so an uneven per-phase split (one weak/importing phase)
+              // can block or badly under-use charging even while the whole
+              // house is net-exporting plenty.
+              //
+              // IMPORTANT: a plain phase-average (report the same blended
+              // value on all 3 registers) broke TWC3's live correlation
+              // check (it compares its own actual ramping current against
+              // the reported value) -- averaging diluted a ramping phase's
+              // signal to ~1/3 of its real slope, so TWC3 saw a mismatch
+              // and stopped charging within seconds.
+              //
+              // Fix: each phase's own real current stays the FULL,
+              // undiluted base term (1:1 correlation, same formula as the
+              // per-phase branch below) -- credit only ever ADDS on top,
+              // never replaces it, so the underlying 1:1 tracking survives
+              // for any phase that doesn't need help.
+              //
+              // An even 1/3-of-pool split (tried first) preserved
+              // correlation but wasted most of the surplus: TWC3 is
+              // bottlenecked by whichever phase is LOWEST, so headroom
+              // handed to already-strong phases is unused.
+              //
+              // Water-filling (tried next, all the way up to the strongest
+              // phase's own value) was a real bug, not just an
+              // over-optimization: TWC3 applies I = min(avail_a, avail_b,
+              // avail_c) as the SAME current on all 3 phases, so total car
+              // power = 3*I. Keeping every phase's own strict_x untouched
+              // while ALSO spending the full pool again on top of it
+              // double-counted the surplus -- e.g. pool=23A water-filled to
+              // min=15.33A implies 3*15.33=46A of power, double the real
+              // 23A available.
+              //
+              // Correct target: for the whole house to stay net-export/zero
+              // in aggregate, 3*I <= pool, i.e. I <= pool/3. That's the
+              // exact ceiling -- no more, no less -- so a phase already
+              // above pool/3 is left alone (1:1 correlation, no dilution),
+              // and a phase below pool/3 is raised exactly up to it (never
+              // higher), so the resulting min(avail) lands exactly on
+              // pool/3 and the true available surplus is fully used with
+              // no double-counting.
+              float strict_a = (id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a;
+              float strict_b = (id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b;
+              float strict_c = (id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c;
+
+              // Only ever a reward (net-export target), never an extra
+              // penalty -- on net import overall this is 0 and behavior is
+              // identical to plain per-phase FVE mode.
+              float pool = strict_a + strict_b + strict_c;
+              float target = (pool > 0.0f) ? (pool / 3.0f) : -1.0f;   // -1 = never wins the max() below
+
+              avail_mode_a = std::max(strict_a, target);
+              avail_mode_b = std::max(strict_b, target);
+              avail_mode_c = std::max(strict_c, target);
+            } else {
+              // Per-phase (default): each phase reacts only to its own
+              // export/import. Export case: round the offered current DOWN
+              // to a whole amp before it feeds into "reported" -- better to
+              // slightly under-use the surplus than overshoot into an
+              // actual import. Import case: no rounding, use the precise value.
+              avail_mode_a = (id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a;
+              avail_mode_b = (id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b;
+              avail_mode_c = (id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c;
+            }
+
+            // protects the main breaker (independent of mode)
+            float avail_main_a = main_breaker - real_a;
+            float avail_main_b = main_breaker - real_b;
+            float avail_main_c = main_breaker - real_c;
+
+            // Floored at 0 -> reported never exceeds twc_breaker_limit_a
+            // (16A cap), instead of climbing further under overload/import.
+            // Testing whether TWC3 reacts better to a hard-capped "0
+            // available" than to values above its own configured limit.
+            float avail_a = std::max(std::min(std::min(avail_mode_a, twc_breaker), avail_main_a), 0.0f);
+            float avail_b = std::max(std::min(std::min(avail_mode_b, twc_breaker), avail_main_b), 0.0f);
+            float avail_c = std::max(std::min(std::min(avail_mode_c, twc_breaker), avail_main_c), 0.0f);
+
+            reported_a = twc_breaker - avail_a;
+            reported_b = twc_breaker - avail_b;
+            reported_c = twc_breaker - avail_c;
+
+            // Escalation: TWC3 ramps down very slowly (observed: minutes)
+            // toward a sustained "0A available" (reported == twc_breaker)
+            // on all 3 phases, and even after ramping down to a few amps
+            // may keep drawing that residual current indefinitely despite
+            // continued import instead of stopping. If all 3 phases have
+            // been pinned at the full breaker limit for 30s+ straight,
+            // nudge reported 0.1A past the limit to force a hard stop.
+            bool fully_capped = (avail_a <= 0.0f && avail_b <= 0.0f && avail_c <= 0.0f);
+            if (fully_capped) {
+              if (id(capped_since_ms) == 0) id(capped_since_ms) = millis();
+              if (millis() - id(capped_since_ms) >= 30000) {
+                ESP_LOGW("shelly", "Reported current pinned at breaker limit for 30s+, escalating to force a hard stop");
+                reported_a = reported_b = reported_c = twc_breaker + 0.1f;
+              }
+            } else {
+              id(capped_since_ms) = 0;
+            }
+          }
+
+          id(ct1_current_a) = reported_a;
+          id(ct2_current_a) = reported_b;
+          id(ct3_current_a) = reported_c;
+          id(ct4_current_a) = 0.0f;
+          id(ct_total_a) = id(ct1_current_a) + id(ct2_current_a) + id(ct3_current_a) + id(ct4_current_a);
+
+          id(ct1_power_w) = voltage * id(ct1_current_a);
+          id(ct2_power_w) = voltage * id(ct2_current_a);
+          id(ct3_power_w) = voltage * id(ct3_current_a);
+          id(ct4_power_w) = 0.0f;
+          id(ct_total_w) = id(ct1_power_w) + id(ct2_power_w) + id(ct3_power_w) + id(ct4_power_w);
+
+switch:
+  # FVE mode only. When your utility nets import/export across all 3 phases
+  # together (aggregate/net billing) rather than settling each phase
+  # separately, TWC3 being bottlenecked by its single weakest/importing
+  # phase (even while other phases export a lot more) is overly
+  # conservative. When this is on, FVE mode still reports each phase's OWN
+  # real current as the base (required for TWC3's live correlation check --
+  # see recompute_ct), then raises any phase below pool/3 (the whole-house
+  # net surplus divided by 3, the exact ceiling for TWC3's single applied
+  # current across all 3 phases) up to that target -- never higher, so the
+  # real surplus is used in full with no double-counting. The per-phase
+  # main-breaker safety check still applies underneath it regardless of
+  # this setting.
+  - platform: template
+    id: aggregate_balance_metering
+    name: "Aggregate Balance Metering"
+    icon: "mdi:swap-horizontal-circle-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# ---------------------------------------------------------------------------
+# Safety-net recompute: recompute_ct is otherwise ONLY triggered by one of
+# the 6 HA-mirrored real-current/power sensors (see "sensor:" below) pushing
+# a new value, an API connect/disconnect, or a charge_from_grid change. If
+# HA stops pushing updates for any reason (entity goes unavailable
+# upstream, etc.) while the API connection itself stays up, none of those
+# would fire again -- shelly_last_ok_ms would sit frozen and the stale
+# check inside recompute_ct would never get re-evaluated. Keep re-checking
+# every tick so the fail-safe still kicks in on time.
+# ---------------------------------------------------------------------------
+interval:
+  - interval: ${recompute_interval}
+    then:
+      - script.execute: recompute_ct
+
+# ---------------------------------------------------------------------------
+# HA diagnostics -- "connected" reflects the actual API connection to HA
+# (not the time of the last value change), see api.on_client_disconnected above.
+# ---------------------------------------------------------------------------
+binary_sensor:
+  - platform: status
+    name: "TWC HA Link OK"
+    id: ha_link_ok
+
+  # --- Is TWC3 currently active (charging/session running and polling regularly)? ---
+  - platform: template
+    name: "TWC Polling Active"
+    id: twc_polling_active
+    device_class: running
+    lambda: |-
+      if (id(last_poll_ms) == 0) return false;
+      return (millis() - id(last_poll_ms)) < 2000;
+
+  # --- Is the Shelly data fresh enough? ---
+  - platform: template
+    name: "Shelly Data Fresh"
+    id: shelly_data_fresh
+    device_class: connectivity
+    lambda: |-
+      if (id(shelly_last_ok_ms) == 0) return false;
+      return (millis() - id(shelly_last_ok_ms)) < (uint32_t)${shelly_stale_timeout_ms};
+
+  # --- Mirrors HA's input_boolean.charge_from_grid (single source of truth lives in HA) ---
+  - platform: homeassistant
+    id: charge_from_grid
+    name: "Charge From Grid (mirror)"
+    entity_id: ${ha_charge_from_grid_entity}
+    on_state:
+      - script.execute: recompute_ct
+
+sensor:
+  # ---------------------------------------------------------------------------
+  # Real per-phase current/power, mirrored in from HA entities (Shelly Pro 3EM
+  # integration in HA) instead of polling Shelly's HTTP API directly. Avoids
+  # Shelly Gen2's brute-force login protection entirely (see the old
+  # switch.*_shelly_polling_enabled kill-switch this replaces) at the cost of
+  # making HA a hard dependency for real-time power control, not just
+  # start/stop -- if the API connection or these entities go stale, we fail
+  # safe (see recompute_ct / ha_api_connected).
+  #
+  # "on_value" fires as soon as HA pushes a new state over the API connection
+  # (real-time, not polled) -- each of the 6 updates the matching global,
+  # stamps shelly_last_ok_ms, and immediately recomputes.
+  # ---------------------------------------------------------------------------
+  - platform: homeassistant
+    id: ha_current_a
+    entity_id: ${ha_current_a_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            id(shelly_a_current) = x;
+            id(shelly_last_ok_ms) = millis();
+        - script.execute: recompute_ct
+  - platform: homeassistant
+    id: ha_current_b
+    entity_id: ${ha_current_b_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            id(shelly_b_current) = x;
+            id(shelly_last_ok_ms) = millis();
+        - script.execute: recompute_ct
+  - platform: homeassistant
+    id: ha_current_c
+    entity_id: ${ha_current_c_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            id(shelly_c_current) = x;
+            id(shelly_last_ok_ms) = millis();
+        - script.execute: recompute_ct
+  # act_power: negative = export to grid, positive = import from grid (same convention as before)
+  - platform: homeassistant
+    id: ha_power_a
+    entity_id: ${ha_power_a_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            id(shelly_a_power) = x;
+            id(shelly_last_ok_ms) = millis();
+        - script.execute: recompute_ct
+  - platform: homeassistant
+    id: ha_power_b
+    entity_id: ${ha_power_b_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            id(shelly_b_power) = x;
+            id(shelly_last_ok_ms) = millis();
+        - script.execute: recompute_ct
+  - platform: homeassistant
+    id: ha_power_c
+    entity_id: ${ha_power_c_entity}
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            id(shelly_c_power) = x;
+            id(shelly_last_ok_ms) = millis();
+        - script.execute: recompute_ct
+
+  - platform: template
+    name: "TWC Reported Current L1"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: "return id(ct1_current_a);"
+
+  - platform: template
+    name: "TWC Reported Current L2"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: "return id(ct2_current_a);"
+
+  - platform: template
+    name: "TWC Reported Current L3"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: "return id(ct3_current_a);"
+
+  # --- Real measured data from Shelly (main incomer) ---
+  - platform: template
+    name: "Shelly Real Current L1"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: "return id(shelly_a_current);"
+
+  - platform: template
+    name: "Shelly Real Current L2"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: "return id(shelly_b_current);"
+
+  - platform: template
+    name: "Shelly Real Current L3"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: "return id(shelly_c_current);"
+
+  # --- Signed active power straight from Shelly (negative = export, positive = import) ---
+  - platform: template
+    name: "Shelly Active Power L1"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return id(shelly_a_power);"
+
+  - platform: template
+    name: "Shelly Active Power L2"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return id(shelly_b_power);"
+
+  - platform: template
+    name: "Shelly Active Power L3"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return id(shelly_c_power);"
+
+  - platform: template
+    name: "Shelly Time Since Last OK"
+    icon: "mdi:timer-alert-outline"
+    unit_of_measurement: "ms"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      if (id(shelly_last_ok_ms) == 0) return NAN;
+      return (float)(millis() - id(shelly_last_ok_ms));
+
+  - platform: uptime
+    name: "TWC Control Uptime"
+
+  - platform: wifi_signal
+    name: "TWC Control WiFi Signal"
+    update_interval: 60s
+
+  # --- TWC3 polling diagnostics (see register 0xF4 below) ---
+  - platform: template
+    name: "TWC Poll Interval"
+    icon: "mdi:timer-sync-outline"
+    unit_of_measurement: "ms"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: "return id(poll_interval_ms);"
+
+  - platform: template
+    name: "TWC Time Since Last Poll"
+    icon: "mdi:timer-alert-outline"
+    unit_of_measurement: "ms"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      if (id(last_poll_ms) == 0) return NAN;
+      return (float)(millis() - id(last_poll_ms));
+
+button:
+  - platform: restart
+    name: "${friendly_name} Restart"
+
+# ---------------------------------------------------------------------------
+# RS485 -> Modbus RTU server; TWC3 acts as the Modbus client/master and
+# polls it regularly. Emulates a Neurio/Generac CT-clamp meter following the
+# reverse-engineered protocol exactly (the identification block 1-55 is
+# fixed, TWC3 needs it to recognize the meter type):
+# https://gist.github.com/LucaTNT/4adf01a7252386559070023612efa117
+# ---------------------------------------------------------------------------
+uart:
+  - id: wallconn_uart
+    tx_pin: ${tx_pin}
+    rx_pin: ${rx_pin}
+    flow_control_pin: ${flow_control_pin}
+    baud_rate: ${baud_rate}
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+
+modbus:
+  - id: wallconn_modbus
+    uart_id: wallconn_uart
+    role: server
+
+modbus_server:
+  - modbus_id: wallconn_modbus
+    address: 1
+    registers:
+      # --- Meter identification block (fixed, taken 1:1 from the proven reference project) ---
+      - { address: 1, value_type: U_WORD, read_lambda: "return 0x3078;" }
+      - { address: 2, value_type: U_WORD, read_lambda: "return 0x3030;" }
+      - { address: 3, value_type: U_WORD, read_lambda: "return 0x3030;" }
+      - { address: 4, value_type: U_WORD, read_lambda: "return 0x3034;" }
+      - { address: 5, value_type: U_WORD, read_lambda: "return 0x3731;" }
+      - { address: 6, value_type: U_WORD, read_lambda: "return 0x3442;" }
+      - { address: 7, value_type: U_WORD, read_lambda: "return 0x3035;" }
+      - { address: 8, value_type: U_WORD, read_lambda: "return 0x3638;" }
+      - { address: 9, value_type: U_WORD, read_lambda: "return 0x3631;" }
+      - { address: 10, value_type: U_WORD, read_lambda: "return 0x0000;" }
+
+      # "1.6.1-Tesla"
+      - { address: 11, value_type: U_WORD, read_lambda: "return 0x312E;" }
+      - { address: 12, value_type: U_WORD, read_lambda: "return 0x362E;" }
+      - { address: 13, value_type: U_WORD, read_lambda: "return 0x312D;" }
+      - { address: 14, value_type: U_WORD, read_lambda: "return 0x5465;" }
+      - { address: 15, value_type: U_WORD, read_lambda: "return 0x736C;" }
+      - { address: 16, value_type: U_WORD, read_lambda: "return 0x6100;" }
+
+      - { address: 17, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 18, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 19, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 20, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+
+      # "012.00020A.H"
+      - { address: 21, value_type: U_WORD, read_lambda: "return 0x3031;" }
+      - { address: 22, value_type: U_WORD, read_lambda: "return 0x322E;" }
+      - { address: 23, value_type: U_WORD, read_lambda: "return 0x3030;" }
+      - { address: 24, value_type: U_WORD, read_lambda: "return 0x3032;" }
+      - { address: 25, value_type: U_WORD, read_lambda: "return 0x3041;" }
+      - { address: 26, value_type: U_WORD, read_lambda: "return 0x2E48;" }
+      - { address: 27, value_type: U_WORD, read_lambda: "return 0x0000;" }
+
+      - { address: 28, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+
+      # Meter number "90954"
+      - { address: 29, value_type: U_WORD, read_lambda: "return 0x3930;" }
+      - { address: 30, value_type: U_WORD, read_lambda: "return 0x3935;" }
+      - { address: 31, value_type: U_WORD, read_lambda: "return 0x3400;" }
+
+      # Model "VAH4810AB0231"
+      - { address: 32, value_type: U_WORD, read_lambda: "return 0x5641;" }
+      - { address: 33, value_type: U_WORD, read_lambda: "return 0x4834;" }
+      - { address: 34, value_type: U_WORD, read_lambda: "return 0x3831;" }
+      - { address: 35, value_type: U_WORD, read_lambda: "return 0x3041;" }
+      - { address: 36, value_type: U_WORD, read_lambda: "return 0x4230;" }
+      - { address: 37, value_type: U_WORD, read_lambda: "return 0x3233;" }
+      - { address: 38, value_type: U_WORD, read_lambda: "return 0x3100;" }
+
+      - { address: 39, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 40, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 41, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 42, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 43, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 44, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 45, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+      - { address: 46, value_type: U_WORD, read_lambda: "return 0xFFFF;" }
+
+      # MAC "04:71:4B:05:68:61"
+      - { address: 47, value_type: U_WORD, read_lambda: "return 0x3034;" }
+      - { address: 48, value_type: U_WORD, read_lambda: "return 0x3A37;" }
+      - { address: 49, value_type: U_WORD, read_lambda: "return 0x313A;" }
+      - { address: 50, value_type: U_WORD, read_lambda: "return 0x3442;" }
+      - { address: 51, value_type: U_WORD, read_lambda: "return 0x3A30;" }
+      - { address: 52, value_type: U_WORD, read_lambda: "return 0x353A;" }
+      - { address: 53, value_type: U_WORD, read_lambda: "return 0x3638;" }
+      - { address: 54, value_type: U_WORD, read_lambda: "return 0x3A36;" }
+      - { address: 55, value_type: U_WORD, read_lambda: "return 0x3100;" }
+
+      # --- Power (W), computed from the reported current ---
+      - { address: 0x88, value_type: FP32, read_lambda: "return id(ct1_power_w);" }
+      - { address: 0x8A, value_type: FP32, read_lambda: "return id(ct2_power_w);" }
+      - { address: 0x8C, value_type: FP32, read_lambda: "return id(ct3_power_w);" }
+      - { address: 0x8E, value_type: FP32, read_lambda: "return id(ct4_power_w);" }
+      - { address: 0x90, value_type: FP32, read_lambda: "return id(ct_total_w);" }
+      - { address: 0x92, value_type: U_WORD, read_lambda: "return 0;" }
+
+      # --- Current (A) -- this is what TWC3 actually uses to compute the available limit ---
+      # 0xF4 (CT1) is the register TWC3 actually polls regularly when
+      # deciding the limit -> used here as the marker for one "poll" cycle.
+      - address: 0xF4
+        value_type: FP32
+        read_lambda: |-
+          uint32_t now = millis();
+          if (id(last_poll_ms) != 0) {
+            id(poll_interval_ms) = (float)(now - id(last_poll_ms));
+          }
+          id(last_poll_ms) = now;
+          return id(ct1_current_a);
+      - { address: 0xF6, value_type: FP32, read_lambda: "return id(ct2_current_a);" }
+      - { address: 0xF8, value_type: FP32, read_lambda: "return id(ct3_current_a);" }
+      - { address: 0xFA, value_type: FP32, read_lambda: "return id(ct4_current_a);" }
+      - { address: 0xFC, value_type: FP32, read_lambda: "return id(ct_total_a);" }
+
+      # --- Initialization handshake ("Generac") ---
+      - { address: 40002, value_type: U_WORD, read_lambda: "return 0x0001;" }
+      - { address: 40003, value_type: U_WORD, read_lambda: "return 0x0042;" }
+      - { address: 40004, value_type: U_WORD, read_lambda: "return 0x4765;" }
+      - { address: 40005, value_type: U_WORD, read_lambda: "return 0x6E65;" }
+      - { address: 40006, value_type: U_WORD, read_lambda: "return 0x7261;" }
+      - { address: 40007, value_type: U_WORD, read_lambda: "return 0x6300;" }
