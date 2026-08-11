@@ -124,6 +124,17 @@ despite continued import instead of stopping outright. If all 3 phases stay
 pinned at the full breaker limit for 30s straight, `reported` is nudged
 0.1A past the limit (`twc_breaker_limit_a + 0.1`) to force a hard stop.
 
+### Disabling external control (`switch.*_twc_control_enabled`)
+
+Master switch for the whole loop, default **ON**. When turned OFF,
+`recompute_ct` reports a constant `0A` (max availability) on all 3 phases
+instead of computing anything live. TWC3's own live correlation check then
+distrusts that static value within seconds of a session starting and falls
+back to its own internal ceiling — i.e. it ends up ignoring this firmware
+entirely and charges at whatever it decides on its own (e.g. the Tesla
+app's own current slider). Useful for temporarily handing a session back to
+TWC3's stock behavior without touching the RS485 wiring or reflashing.
+
 ## Before the first flash
 
 1. Copy `secrets.yaml.example` → `secrets.yaml` (it's in `.gitignore`, never
@@ -189,6 +200,8 @@ python3 -m venv venv
 - `binary_sensor.*_charge_from_grid` — currently mirrored mode from HA.
 - `switch.*_aggregate_balance_metering` — **default OFF**, FVE-mode-only, see
   "aggregate/net balance metering" above.
+- `switch.*_twc_control_enabled` — **default ON**, see "Disabling external
+  control" above.
 
 ## Known limitations / behavior
 

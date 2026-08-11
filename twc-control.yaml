@@ -242,7 +242,18 @@ script:
           }
 
           float reported_a, reported_b, reported_c;
-          if (shelly_stale || !id(ha_api_connected)) {
+          if (!id(twc_control_enabled).state) {
+            // Deliberately report a constant 0A (max availability) on all
+            // 3 phases instead of computing anything live. TWC3's live
+            // correlation check (see the aggregate-metering design history
+            // below) then distrusts this static value within seconds of a
+            // session starting and falls back to its own internal ceiling
+            // -- i.e. it ends up ignoring us entirely and charges at
+            // whatever it decides on its own, effectively disabling this
+            // whole external control loop on purpose.
+            reported_a = reported_b = reported_c = 0.0f;
+            id(capped_since_ms) = 0;
+          } else if (shelly_stale || !id(ha_api_connected)) {
             ESP_LOGW("shelly", "Shelly stale or HA API disconnected, fail-safe to 0A");
             reported_a = reported_b = reported_c = twc_breaker;
           } else {
@@ -373,6 +384,27 @@ script:
           id(ct_total_w) = id(ct1_power_w) + id(ct2_power_w) + id(ct3_power_w) + id(ct4_power_w);
 
 switch:
+  # Master switch for the whole external control loop. When OFF,
+  # recompute_ct reports a constant 0A (max availability) on all 3 phases
+  # instead of computing anything live -- TWC3's own live correlation
+  # check then distrusts that static value within seconds of a session
+  # starting and falls back to its own internal ceiling, i.e. it ends up
+  # ignoring this firmware entirely and charges at whatever it decides on
+  # its own. Use this to hand a charging session fully back to TWC3's
+  # stock behavior (e.g. the Tesla app's own current slider) without
+  # touching the RS485 wiring or reflashing. Default ON -- external
+  # control is active by default.
+  - platform: template
+    id: twc_control_enabled
+    name: "TWC Control Enabled"
+    icon: "mdi:power-plug-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - script.execute: recompute_ct
+    on_turn_off:
+      - script.execute: recompute_ct
+
   # FVE mode only. When your utility nets import/export across all 3 phases
   # together (aggregate/net billing) rather than settling each phase
   # separately, TWC3 being bottlenecked by its single weakest/importing
