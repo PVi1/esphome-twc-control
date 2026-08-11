@@ -25,12 +25,16 @@ substitutions:
   #     entities -- see the "sensor: platform: homeassistant" block below.
   #     HA is a hard dependency for this: if the API connection or the HA
   #     entities go stale, we fail safe (see recompute_ct). ---
-  # HA-mirrored sensors only push a new value when HA itself sees one
-  # (Shelly's own rate-limiting/threshold in its HA integration), NOT on a
-  # fixed 1s cadence like the old direct-HTTP-poll design -- 5000ms was too
-  # tight and caused shelly_data_fresh to flap. 15s gives real headroom
-  # while still catching an actually-dead link reasonably fast.
-  shelly_stale_timeout_ms: "15000"    # no fresh data -> fail-safe
+  # Availability is driven by HA's OWN "unavailable"/"unknown" state for
+  # each entity (see recompute_ct), NOT a fixed no-update timeout -- a
+  # timeout can't tell "Shelly is offline" apart from "the load just isn't
+  # changing", which caused false staleness during genuinely stable load.
+  # This debounce only guards against a real HA-reported outage flapping
+  # (e.g. Shelly on a powerline/mesh link with brief dropouts) -- give HA
+  # a chance to reconnect on its own before we react. 10s covers typical
+  # powerline/WiFi hiccups without leaving a genuine outage unprotected
+  # for long.
+  shelly_unavailable_debounce_ms: "10000"
   recompute_interval: "1000ms"        # periodic safety-net recompute, independent of HA pushes
 
   # HA entity IDs (live in secrets.yaml, not published -- entity IDs can
@@ -182,11 +186,51 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
-  # last time ANY of the 6 HA-mirrored sensors above pushed a fresh value
+  # last time ANY of the 6 HA-mirrored sensors above pushed a fresh (valid,
+  # non-NAN) value -- purely informational (see "Shelly Time Since Last
+  # OK"), no longer drives the fail-safe decision, see shelly_*_available below.
   - id: shelly_last_ok_ms
     type: uint32_t
     restore_value: no
-    initial_value: "0"          # 0 = no valid response has ever arrived yet -> fail-safe
+    initial_value: "0"
+
+  # --- Per-entity availability, driven by HA's own "unavailable"/"unknown"
+  #     state (see the on_value lambdas below: ESPHome's homeassistant
+  #     sensor publishes NAN when the entity's HA state fails to parse as a
+  #     number, which is exactly what happens on those 2 states) -- start
+  #     false (unavailable) until the first real value arrives. ---
+  - id: ha_current_a_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ha_current_b_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ha_current_c_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ha_power_a_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ha_power_b_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: ha_power_c_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  # 0 = currently fully available; otherwise the millis() timestamp when
+  # unavailability (any of the 6 flags above going false) started -- the
+  # debounce in recompute_ct only reacts once this has held continuously
+  # for shelly_unavailable_debounce_ms.
+  - id: shelly_unavailable_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
 
 # ---------------------------------------------------------------------------
 # Two breakers protected at once -- the TWC sub-breaker (twc_breaker_limit_a)
@@ -221,7 +265,8 @@ globals:
 # If the HA charge_from_grid entity doesn't have a valid state yet, we
 # safely fall back to GRID mode (more conservative, proven to work).
 #
-# Fail-safe: if the Shelly data isn't fresh (> shelly_stale_timeout_ms) OR
+# Fail-safe: if any of the 6 HA-mirrored entities has been reporting
+# unavailable/unknown continuously for shelly_unavailable_debounce_ms, OR
 # the HA API isn't connected (can't trust the mirrored charge_from_grid),
 # report full consumption (twc_breaker_limit_a) on all phases = 0A for the car.
 # ---------------------------------------------------------------------------
@@ -233,8 +278,21 @@ script:
           const float main_breaker = ${main_breaker_limit_a};
           const float voltage = 230.0f;
 
-          bool shelly_stale = (id(shelly_last_ok_ms) == 0) ||
-              (millis() - id(shelly_last_ok_ms) > (uint32_t)${shelly_stale_timeout_ms});
+          // Availability is HA's own signal (see the on_value lambdas
+          // below), not a fixed no-update timeout -- debounced so a brief
+          // HA-reported outage (e.g. Shelly on a flaky powerline/mesh
+          // link) doesn't immediately trip the fail-safe; only a
+          // continuous outage past shelly_unavailable_debounce_ms does.
+          bool all_available = id(ha_current_a_available) && id(ha_current_b_available) &&
+              id(ha_current_c_available) && id(ha_power_a_available) &&
+              id(ha_power_b_available) && id(ha_power_c_available);
+          if (!all_available) {
+            if (id(shelly_unavailable_since_ms) == 0) id(shelly_unavailable_since_ms) = millis();
+          } else {
+            id(shelly_unavailable_since_ms) = 0;
+          }
+          bool shelly_stale = (id(shelly_unavailable_since_ms) != 0) &&
+              (millis() - id(shelly_unavailable_since_ms) >= (uint32_t)${shelly_unavailable_debounce_ms});
 
           bool grid_mode = true;
           if (id(charge_from_grid).has_state()) {
@@ -427,12 +485,12 @@ switch:
 # ---------------------------------------------------------------------------
 # Safety-net recompute: recompute_ct is otherwise ONLY triggered by one of
 # the 6 HA-mirrored real-current/power sensors (see "sensor:" below) pushing
-# a new value, an API connect/disconnect, or a charge_from_grid change. If
-# HA stops pushing updates for any reason (entity goes unavailable
-# upstream, etc.) while the API connection itself stays up, none of those
-# would fire again -- shelly_last_ok_ms would sit frozen and the stale
-# check inside recompute_ct would never get re-evaluated. Keep re-checking
-# every tick so the fail-safe still kicks in on time.
+# a new value, an API connect/disconnect, or a charge_from_grid change.
+# Also the ONLY thing that keeps re-checking the unavailable-debounce timer
+# once an entity flips to unavailable and then just stays that way -- that
+# on_value fires once on the transition, but nothing else would fire again
+# to notice the debounce window has since elapsed. Keep re-checking every
+# tick so the fail-safe still kicks in on time.
 # ---------------------------------------------------------------------------
 interval:
   - interval: ${recompute_interval}
@@ -457,14 +515,16 @@ binary_sensor:
       if (id(last_poll_ms) == 0) return false;
       return (millis() - id(last_poll_ms)) < 2000;
 
-  # --- Is the Shelly data fresh enough? ---
+  # --- Is the Shelly data available? Mirrors the exact same debounced
+  #     availability check recompute_ct uses for its fail-safe decision --
+  #     see shelly_unavailable_since_ms / recompute_ct. ---
   - platform: template
     name: "Shelly Data Fresh"
     id: shelly_data_fresh
     device_class: connectivity
     lambda: |-
-      if (id(shelly_last_ok_ms) == 0) return false;
-      return (millis() - id(shelly_last_ok_ms)) < (uint32_t)${shelly_stale_timeout_ms};
+      if (id(shelly_unavailable_since_ms) == 0) return true;
+      return (millis() - id(shelly_unavailable_since_ms)) < (uint32_t)${shelly_unavailable_debounce_ms};
 
   # --- Mirrors HA's input_boolean.charge_from_grid (single source of truth lives in HA) ---
   - platform: homeassistant
@@ -484,9 +544,14 @@ sensor:
   # start/stop -- if the API connection or these entities go stale, we fail
   # safe (see recompute_ct / ha_api_connected).
   #
-  # "on_value" fires as soon as HA pushes a new state over the API connection
-  # (real-time, not polled) -- each of the 6 updates the matching global,
-  # stamps shelly_last_ok_ms, and immediately recomputes.
+  # "on_value" fires as soon as HA pushes a new state over the API
+  # connection (real-time, not polled). ESPHome's homeassistant sensor
+  # publishes NAN when the entity's HA state is "unavailable"/"unknown"
+  # (fails to parse as a number) -- checked here to drive the matching
+  # ha_*_available flag (see recompute_ct for the debounce that turns
+  # this into the actual fail-safe decision). A valid value additionally
+  # stamps shelly_last_ok_ms (informational only, see "Shelly Time Since
+  # Last OK").
   # ---------------------------------------------------------------------------
   - platform: homeassistant
     id: ha_current_a
@@ -495,8 +560,14 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            id(shelly_a_current) = x;
-            id(shelly_last_ok_ms) = millis();
+            if (std::isnan(x)) {
+              ESP_LOGW("shelly", "%s reported unavailable", "${ha_current_a_entity}");
+              id(ha_current_a_available) = false;
+            } else {
+              id(shelly_a_current) = x;
+              id(shelly_last_ok_ms) = millis();
+              id(ha_current_a_available) = true;
+            }
         - script.execute: recompute_ct
   - platform: homeassistant
     id: ha_current_b
@@ -505,8 +576,14 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            id(shelly_b_current) = x;
-            id(shelly_last_ok_ms) = millis();
+            if (std::isnan(x)) {
+              ESP_LOGW("shelly", "%s reported unavailable", "${ha_current_b_entity}");
+              id(ha_current_b_available) = false;
+            } else {
+              id(shelly_b_current) = x;
+              id(shelly_last_ok_ms) = millis();
+              id(ha_current_b_available) = true;
+            }
         - script.execute: recompute_ct
   - platform: homeassistant
     id: ha_current_c
@@ -515,8 +592,14 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            id(shelly_c_current) = x;
-            id(shelly_last_ok_ms) = millis();
+            if (std::isnan(x)) {
+              ESP_LOGW("shelly", "%s reported unavailable", "${ha_current_c_entity}");
+              id(ha_current_c_available) = false;
+            } else {
+              id(shelly_c_current) = x;
+              id(shelly_last_ok_ms) = millis();
+              id(ha_current_c_available) = true;
+            }
         - script.execute: recompute_ct
   # act_power: negative = export to grid, positive = import from grid (same convention as before)
   - platform: homeassistant
@@ -526,8 +609,14 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            id(shelly_a_power) = x;
-            id(shelly_last_ok_ms) = millis();
+            if (std::isnan(x)) {
+              ESP_LOGW("shelly", "%s reported unavailable", "${ha_power_a_entity}");
+              id(ha_power_a_available) = false;
+            } else {
+              id(shelly_a_power) = x;
+              id(shelly_last_ok_ms) = millis();
+              id(ha_power_a_available) = true;
+            }
         - script.execute: recompute_ct
   - platform: homeassistant
     id: ha_power_b
@@ -536,8 +625,14 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            id(shelly_b_power) = x;
-            id(shelly_last_ok_ms) = millis();
+            if (std::isnan(x)) {
+              ESP_LOGW("shelly", "%s reported unavailable", "${ha_power_b_entity}");
+              id(ha_power_b_available) = false;
+            } else {
+              id(shelly_b_power) = x;
+              id(shelly_last_ok_ms) = millis();
+              id(ha_power_b_available) = true;
+            }
         - script.execute: recompute_ct
   - platform: homeassistant
     id: ha_power_c
@@ -546,8 +641,14 @@ sensor:
     on_value:
       then:
         - lambda: |-
-            id(shelly_c_power) = x;
-            id(shelly_last_ok_ms) = millis();
+            if (std::isnan(x)) {
+              ESP_LOGW("shelly", "%s reported unavailable", "${ha_power_c_entity}");
+              id(ha_power_c_available) = false;
+            } else {
+              id(shelly_c_power) = x;
+              id(shelly_last_ok_ms) = millis();
+              id(ha_power_c_available) = true;
+            }
         - script.execute: recompute_ct
 
   - platform: template

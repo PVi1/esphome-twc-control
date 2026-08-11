@@ -52,12 +52,24 @@ mode), and from the bottom at `0` — so `reported` always stays within
 `[0, twc_breaker_limit_a]`, never a flat "0 available" for longer than
 actually needed and never an out-of-range value either.
 
-Fail-safe: if the HA-mirrored data isn't fresh (`shelly_stale_timeout_ms`)
-OR the HA API client isn't connected, full consumption is reported on all
-phases → TWC3 gets 0A available for the car. A periodic safety-net
-recompute (`recompute_interval`, independent of any HA push) keeps
-re-checking this even if HA stops sending updates without dropping the API
-connection itself.
+Fail-safe: if any of the 6 HA-mirrored current/power entities has been
+reporting `unavailable`/`unknown` continuously for
+`shelly_unavailable_debounce_ms` (default 10s), OR the HA API client isn't
+connected, full consumption is reported on all phases → TWC3 gets 0A
+available for the car.
+
+Availability is driven by **HA's own reported state**, not a fixed
+no-update timeout — a timeout can't tell "Shelly went offline" apart from
+"the load just isn't changing" (HA/Shelly only push a new value when one
+actually occurs), which caused false staleness during genuinely stable
+load. ESPHome's `homeassistant` sensor publishes `NAN` whenever the
+entity's HA state fails to parse as a number (i.e. exactly on
+`unavailable`/`unknown`), which is what's checked. The debounce only
+absorbs a brief HA-reported outage (e.g. Shelly on a flaky powerline/mesh
+link) — HA gets a chance to reconnect on its own before the fail-safe
+reacts. A periodic safety-net recompute (`recompute_interval`, independent
+of any HA push) keeps the debounce timer itself re-evaluated even if HA
+stops sending updates without dropping the API connection.
 
 ### GRID mode
 
@@ -195,7 +207,8 @@ python3 -m venv venv
 - `sensor.*_shelly_real_current_l1/l2/l3`, `*_shelly_active_power_l1/l2/l3` —
   real measured data mirrored in from HA (signed power: − export, + import).
 - `sensor.*_twc_reported_current_l1/l2/l3` — what's currently being reported to TWC3.
-- `binary_sensor.*_shelly_data_fresh` — is the mirrored real-current/power data fresh.
+- `binary_sensor.*_shelly_data_fresh` — is the mirrored real-current/power
+  data available (HA-reported, debounced — see Fail-safe above).
 - `binary_sensor.*_twc_ha_link_ok` — is the HA API connection active.
 - `binary_sensor.*_charge_from_grid` — currently mirrored mode from HA.
 - `switch.*_aggregate_balance_metering` — **default OFF**, FVE-mode-only, see
