@@ -67,18 +67,25 @@ substitutions:
   # that would've gotten 7A ungained -> never started).
   #
   # 0.75 (confirmed live, combined with the escalation_timeout_ms raise
-  # below) starts and keeps charging without stopping, but still leaves a
-  # visible residual oscillation (~12-16A) during steady-state draw --
-  # 0.75 damps enough to avoid the WORST failure (undershoot/no-start,
-  # forced stop) but isn't low enough to fully converge.
+  # below) starts and keeps charging without stopping, but leaves a visible
+  # residual oscillation (~12-16A) during steady-state draw.
   #
-  # Testing 0.65 next: more damping (multiplier -0.65 vs -0.75) for less
-  # residual oscillation, still a comfortable margin above the point where
-  # gain=0.5 broke (0.65/0.75 = 87% of the previous working target, e.g.
-  # 5.25A -> ~4.55A in that same reference scenario -- worth watching
-  # closely for a repeat of the below-5A no-start failure at lower surplus
-  # levels specifically, since that scenario is right at the edge).
-  self_balance_gain: "0.65"
+  # 0.65 (also confirmed live) damps that residual oscillation down to
+  # brief, self-recovering blips on a real load transient (an appliance
+  # switching on) and otherwise holds steady -- but leaves noticeably more
+  # surplus unused at equilibrium (E/(1+k) grows as k shrinks: even *zero*
+  # damping, k=1, already leaves E/2 unused -- this self-referential loop
+  # structurally never uses 100% of the surplus, gain reduction just makes
+  # that worse). Observed: ~1300-2000W of real surplus sitting unused.
+  #
+  # Back to 0.75: the start/stop cycling seen at 0.75 originally was root-
+  # caused to escalation_timeout_ms being too short for the startup
+  # transient (see below), NOT the gain itself -- once that was fixed,
+  # 0.75 ran stably too. Since 0.75 was confirmed stable independent of the
+  # gain-vs-oscillation trade-off, prefer it over 0.65 for less wasted
+  # surplus (~2A more charge current), accepting the larger (but
+  # non-fatal, self-bounded) residual oscillation during steady-state draw.
+  self_balance_gain: "0.75"
 
   # Confirmed live: raising this from 30000 (30s) fixed the start/stop
   # cycling -- the gain-reduced self-balancing loop was touching the
