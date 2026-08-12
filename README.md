@@ -144,22 +144,30 @@ hunted between ~8-12A, indefinitely).
   exactly when a smoothed value was still catching up to an already-changed
   real current).
 - Fix instead: a plain multiplicative gain `k` (`self_balance_gain`,
-  currently `0.65`), recomputed fresh every cycle from the *current* real
+  currently `0.75`), recomputed fresh every cycle from the *current* real
   reading only — no history, no lag, so it still moves in lockstep with
   TWC3's own current changes (same cycle), just with reduced slope.
   Iterating `I_(n+1) = k*E - k*I_n` has multiplier `-k` instead of `-1`,
   which converges for `k < 1`.
 - Trade-off: the equilibrium settles at a fraction of the theoretical max
-  surplus usage, not the full amount — confirmed live, a few hundred W of
-  real surplus goes unused at steady state. This is the price of stability
-  without a full PID controller.
+  surplus usage, not the full amount — confirmed live, several hundred W
+  to ~2kW of real surplus can go unused at steady state depending on `k`.
+  This is the price of stability without a full PID controller. The
+  unused fraction is `E/(1+k)` — even *zero* damping (`k=1`) already
+  leaves `E/2` unused, since the car's own current is fed back into its
+  own availability calculation; gain reduction only makes that worse. `k`
+  is a direct trade: lower = smaller residual oscillation, less usable
+  surplus; higher = more surplus used, larger (but still bounded,
+  self-recovering) oscillation. `0.65` and `0.75` were both confirmed
+  stable live (no stopping) over multi-minute sessions including real
+  load transients — `0.75` chosen for noticeably less wasted surplus
+  (~1.5kW unused vs. `0.65`'s ~1.3-2kW) at the cost of a visibly larger
+  residual wobble during steady-state draw.
 - Gain has a floor: TWC3's own minimum charge current is 5A, and too low a
   `k` shrinks the aggregate `pool/3` target (which absorbs the same gain as
   every `strict_x` feeding into it) below that floor — confirmed live,
   `k=0.5` produced a target of 3.5A in a real scenario that would've
-  gotten 7A ungained, and charging never started at all. `k=0.65` keeps
-  enough headroom above 5A in the same class of scenario while still
-  meaningfully damping the oscillation.
+  gotten 7A ungained, and charging never started at all.
 
 **Escalation (`escalation_timeout_ms`, all modes):** TWC3 was observed to
 ramp down very slowly toward a sustained `reported == twc_breaker_limit_a`
