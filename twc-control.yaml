@@ -37,6 +37,57 @@ substitutions:
   shelly_unavailable_debounce_ms: "10000"
   recompute_interval: "1000ms"        # periodic safety-net recompute, independent of HA pushes
 
+  # --- Self-balancing loop gain (FVE modes only, see recompute_ct) ---
+  # The self-balancing formula feeds the car's OWN current straight back
+  # into its own availability calculation with full 1:1 gain -- a textbook
+  # marginally-stable discrete feedback loop (multiplier -1), which
+  # combined with the hard 0/twc_breaker_limit_a saturation limits
+  # produces a sustained bang-bang oscillation instead of converging.
+  #
+  # A temporal fix (EMA/low-pass smoothing) was tried and reverted: any
+  # such filter necessarily lags the reported value behind TWC3's actual
+  # current, and TWC3's live correlation check distrusts that mismatch and
+  # stops charging -- confirmed live (charging stopped/restarted exactly
+  # when a smoothed value was still catching up to an already-changed
+  # real current).
+  #
+  # Fix instead applies a plain multiplicative gain, recomputed fresh
+  # every cycle from the CURRENT real reading only -- no history, no lag,
+  # so it still moves in perfect lockstep (same cycle) with TWC3's own
+  # current changes, just with reduced slope. Iterating I_(n+1) = k*E -
+  # k*I_n has multiplier -k instead of -1, which converges for k<1
+  # instead of oscillating forever. Trade-off: the self-balancing
+  # equilibrium settles at a fraction of the theoretical max surplus
+  # usage rather than the full amount -- the price of stability without
+  # a PID controller.
+  # NOTE: TWC3's own minimum charge current is 5A -- too low a gain shrinks
+  # the aggregate target (target = pool/3, which absorbs the SAME gain as
+  # every strict_x feeding into it) below that floor and charging never
+  # starts at all (confirmed live: gain=0.5 -> target=3.5A on a phase
+  # that would've gotten 7A ungained -> never started).
+  #
+  # 0.75 (confirmed live, combined with the escalation_timeout_ms raise
+  # below) starts and keeps charging without stopping, but still leaves a
+  # visible residual oscillation (~12-16A) during steady-state draw --
+  # 0.75 damps enough to avoid the WORST failure (undershoot/no-start,
+  # forced stop) but isn't low enough to fully converge.
+  #
+  # Testing 0.65 next: more damping (multiplier -0.65 vs -0.75) for less
+  # residual oscillation, still a comfortable margin above the point where
+  # gain=0.5 broke (0.65/0.75 = 87% of the previous working target, e.g.
+  # 5.25A -> ~4.55A in that same reference scenario -- worth watching
+  # closely for a repeat of the below-5A no-start failure at lower surplus
+  # levels specifically, since that scenario is right at the edge).
+  self_balance_gain: "0.65"
+
+  # Confirmed live: raising this from 30000 (30s) fixed the start/stop
+  # cycling -- the gain-reduced self-balancing loop was touching the
+  # reported=twc_breaker_limit_a ceiling briefly during a session's
+  # startup transient (before it settles), and 30s was long enough for
+  # that transient alone to trigger this escalation, forcing a hard stop
+  # right after every start.
+  escalation_timeout_ms: "120000"
+
   # HA entity IDs (live in secrets.yaml, not published -- entity IDs can
   # reveal LAN/device naming and household setup)
   ha_current_a_entity: !secret ha_current_a_entity
@@ -369,9 +420,13 @@ script:
               // higher), so the resulting min(avail) lands exactly on
               // pool/3 and the true available surplus is fully used with
               // no double-counting.
-              float strict_a = (id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a;
-              float strict_b = (id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b;
-              float strict_c = (id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c;
+              // Loop-gain reduction (see self_balance_gain above) applied
+              // right at the source -- pool/target inherit it automatically
+              // since they're a linear combination of strict_a/b/c.
+              const float gain = ${self_balance_gain};
+              float strict_a = gain * ((id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a);
+              float strict_b = gain * ((id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b);
+              float strict_c = gain * ((id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c);
 
               // Only ever a reward (net-export target), never an extra
               // penalty -- on net import overall this is 0 and behavior is
@@ -387,10 +442,14 @@ script:
               // export/import. Export case: round the offered current DOWN
               // to a whole amp before it feeds into "reported" -- better to
               // slightly under-use the surplus than overshoot into an
-              // actual import. Import case: no rounding, use the precise value.
-              avail_mode_a = (id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a;
-              avail_mode_b = (id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b;
-              avail_mode_c = (id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c;
+              // actual import. Import case: no rounding, use the precise
+              // value. Loop-gain reduction (see self_balance_gain above)
+              // applied on top -- same oscillation-vs-max-utilization
+              // trade-off as the aggregate branch.
+              const float gain = ${self_balance_gain};
+              avail_mode_a = gain * ((id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a);
+              avail_mode_b = gain * ((id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b);
+              avail_mode_c = gain * ((id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c);
             }
 
             // protects the main breaker (independent of mode)
@@ -415,13 +474,13 @@ script:
             // on all 3 phases, and even after ramping down to a few amps
             // may keep drawing that residual current indefinitely despite
             // continued import instead of stopping. If all 3 phases have
-            // been pinned at the full breaker limit for 30s+ straight,
-            // nudge reported 0.1A past the limit to force a hard stop.
+            // been pinned at the full breaker limit for escalation_timeout_ms+
+            // straight, nudge reported 0.1A past the limit to force a hard stop.
             bool fully_capped = (avail_a <= 0.0f && avail_b <= 0.0f && avail_c <= 0.0f);
             if (fully_capped) {
               if (id(capped_since_ms) == 0) id(capped_since_ms) = millis();
-              if (millis() - id(capped_since_ms) >= 30000) {
-                ESP_LOGW("shelly", "Reported current pinned at breaker limit for 30s+, escalating to force a hard stop");
+              if (millis() - id(capped_since_ms) >= (uint32_t)${escalation_timeout_ms}) {
+                ESP_LOGW("shelly", "Reported current pinned at breaker limit for escalation_timeout_ms+, escalating to force a hard stop");
                 reported_a = reported_b = reported_c = twc_breaker + 0.1f;
               }
             } else {

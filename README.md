@@ -117,7 +117,7 @@ track together (confirmed by direct testing, several iterations):
    minimum double-counted it — e.g. a real 23A/~5.3kW pool got water-filled
    to `min(avail) = 15.33A`, implying `3*15.33 ≈ 46A`/~10.6kW of charging
    power from surplus that didn't exist.
-4. Final: **`avail_mode_x = max(strict_x, pool/3)`**. For the whole house to
+4. Fourth: **`avail_mode_x = max(strict_x, pool/3)`**. For the whole house to
    stay net-export/zero in aggregate, `3*I <= pool` must hold, i.e.
    `I <= pool/3` — that's the exact, no-more-no-less ceiling. A phase
    already above `pool/3` is left untouched (1:1 correlation, no dilution);
@@ -129,12 +129,53 @@ track together (confirmed by direct testing, several iterations):
 The per-phase main-breaker safety check (`main_breaker_limit_a - real`)
 still applies underneath all 3 variants, unconditionally.
 
-**Escalation (all modes):** TWC3 was observed to ramp down very slowly
-toward a sustained `reported == twc_breaker_limit_a` (0A available) on all
-3 phases, and could keep drawing a small residual current indefinitely
-despite continued import instead of stopping outright. If all 3 phases stay
-pinned at the full breaker limit for 30s straight, `reported` is nudged
-0.1A past the limit (`twc_breaker_limit_a + 0.1`) to force a hard stop.
+**Self-balancing loop gain (`self_balance_gain`)** — the formula above still
+feeds the car's own current straight back into its own availability
+calculation with full 1:1 weight, which is a textbook marginally-stable
+discrete feedback loop (multiplier -1): with a constant household load and
+constant PV output, this produces a *sustained bang-bang oscillation*
+instead of converging (confirmed live — reported cycling ~13-16A while TWC3
+hunted between ~8-12A, indefinitely).
+
+- A temporal fix (EMA/low-pass smoothing of `reported`) was tried and
+  reverted: any such filter necessarily lags the reported value behind
+  TWC3's actual current, and TWC3's live correlation check distrusts that
+  mismatch and stops charging (confirmed live — charging stopped/restarted
+  exactly when a smoothed value was still catching up to an already-changed
+  real current).
+- Fix instead: a plain multiplicative gain `k` (`self_balance_gain`,
+  currently `0.65`), recomputed fresh every cycle from the *current* real
+  reading only — no history, no lag, so it still moves in lockstep with
+  TWC3's own current changes (same cycle), just with reduced slope.
+  Iterating `I_(n+1) = k*E - k*I_n` has multiplier `-k` instead of `-1`,
+  which converges for `k < 1`.
+- Trade-off: the equilibrium settles at a fraction of the theoretical max
+  surplus usage, not the full amount — confirmed live, a few hundred W of
+  real surplus goes unused at steady state. This is the price of stability
+  without a full PID controller.
+- Gain has a floor: TWC3's own minimum charge current is 5A, and too low a
+  `k` shrinks the aggregate `pool/3` target (which absorbs the same gain as
+  every `strict_x` feeding into it) below that floor — confirmed live,
+  `k=0.5` produced a target of 3.5A in a real scenario that would've
+  gotten 7A ungained, and charging never started at all. `k=0.65` keeps
+  enough headroom above 5A in the same class of scenario while still
+  meaningfully damping the oscillation.
+
+**Escalation (`escalation_timeout_ms`, all modes):** TWC3 was observed to
+ramp down very slowly toward a sustained `reported == twc_breaker_limit_a`
+(0A available) on all 3 phases, and could keep drawing a small residual
+current indefinitely despite continued import instead of stopping outright.
+If all 3 phases stay pinned at the full breaker limit for
+`escalation_timeout_ms` straight, `reported` is nudged 0.1A past the limit
+(`twc_breaker_limit_a + 0.1`) to force a hard stop.
+
+Confirmed live: the gain-damped self-balancing loop still briefly touches
+the `reported == twc_breaker_limit_a` ceiling during a session's *startup*
+transient (before it settles) — the original 30s threshold was short enough
+for that transient alone to trigger this escalation, forcing a hard stop
+right after every session start, which then restarted, repeating
+indefinitely. Raised to 120s, which gives the loop enough time to settle
+past the startup transient before escalation can trigger.
 
 ### Disabling external control (`switch.*_twc_control_enabled`)
 
@@ -233,6 +274,11 @@ python3 -m venv venv
 - FVE mode (both per-phase and aggregate) is a bang-bang controller (not
   PID) — near `signed≈0` (exactly balanced) it may pulse slightly around
   zero grid exchange.
+- `self_balance_gain < 1` (see "Self-balancing loop gain" above) trades
+  full surplus utilization for stability: confirmed live, a few hundred W
+  of real export goes unused at steady state, and a real load transient
+  (e.g. an appliance switching on) can still cause brief, self-recovering
+  oscillation before the loop re-settles.
 - The register map (identification block, Neurio meter MAC/model/serial
   number) is a fixed placeholder taken from the reverse-engineered project
   linked below — it's not real data from any physical device.
