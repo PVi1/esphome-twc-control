@@ -294,6 +294,12 @@ python3 -m venv venv
 ## Sources
 
 - https://gist.github.com/LucaTNT/4adf01a7252386559070023612efa117 (register mapping)
-- https://github.com/Klangen82/tesla-wall-connector-control
+- https://github.com/Klangen82/tesla-wall-connector-control (MIT License)
 - https://community.home-assistant.io/t/tesla-wall-connector-gen-3-via-esphome-rs485-dynamic-current-control-no-wifi/985613
 - https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/EM (EM.GetStatus RPC)
+
+## License
+
+[MIT](LICENSE) — chosen for compatibility with
+[Klangen82/tesla-wall-connector-control](https://github.com/Klangen82/tesla-wall-connector-control)
+(also MIT), the primary code source referenced above.
