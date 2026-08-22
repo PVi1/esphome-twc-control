@@ -37,63 +37,95 @@ substitutions:
   shelly_unavailable_debounce_ms: "10000"
   recompute_interval: "1000ms"        # periodic safety-net recompute, independent of HA pushes
 
-  # --- Self-balancing loop gain (FVE modes only, see recompute_ct) ---
-  # The self-balancing formula feeds the car's OWN current straight back
-  # into its own availability calculation with full 1:1 gain -- a textbook
-  # marginally-stable discrete feedback loop (multiplier -1), which
-  # combined with the hard 0/twc_breaker_limit_a saturation limits
-  # produces a sustained bang-bang oscillation instead of converging.
+  # --- Publication law (see recompute_ct) ---
+  # TWC3 FW 26.26.1 ignores "reported" below its own configured breaker
+  # limit entirely (dead-band from a stopped state; once charging, it
+  # holds exactly at the limit) and only reacts once "reported" crosses
+  # the limit by a margin -- confirmed live, consistently ~1.1-1.2A above
+  # twc_breaker_limit_a, across multiple independent trials and two
+  # different HA data sources (see MEMORY.md / project notes). Below the
+  # limit, reported must still track the actual (worst-phase) current 1:1
+  # -- diluting that slope (e.g. a gain applied everywhere, tried and
+  # reverted) doesn't help control (TWC ignores the exact value below the
+  # limit anyway) and only risks a live-correlation distrust latch or
+  # blocking the very first minimum-current start check.
   #
-  # A temporal fix (EMA/low-pass smoothing) was tried and reverted: any
-  # such filter necessarily lags the reported value behind TWC3's actual
-  # current, and TWC3's live correlation check distrusts that mismatch and
-  # stops charging -- confirmed live (charging stopped/restarted exactly
-  # when a smoothed value was still catching up to an already-changed
-  # real current).
+  # This design -- worst-phase symmetric publish, gain=1 below the limit,
+  # a compressed-and-capped excess above it, an ASYMMETRIC anti-glitch
+  # firewall (rises trusted immediately, drops need 2-sample confirmation),
+  # dither, and a hard floor at the car's own measured draw applied to the
+  # INPUT signal -- is adapted from an independently-developed,
+  # live-validated solution to the identical TWC3 FW behavior:
+  # https://github.com/zany92/tesla-loadpilot
+  # (esphome/packages/twc-core.yaml, verified against the actual source,
+  # not just its docs/AI_KNOWLEDGE.md summary -- an earlier version of
+  # this file implemented a "decaying tail" the summary described, which
+  # does NOT actually exist in the real code and caused a real bug here:
+  # confirmed live, it could push reported 2A+ past the limit in a single
+  # step, well past excess_max_a, and appears to have caused TWC3 to
+  # abort the session (contactor open) rather than just throttle, during
+  # exactly the fast multi-phase-engagement startup window. Removed.
   #
-  # Fix instead applies a plain multiplicative gain, recomputed fresh
-  # every cycle from the CURRENT real reading only -- no history, no lag,
-  # so it still moves in perfect lockstep (same cycle) with TWC3's own
-  # current changes, just with reduced slope. Iterating I_(n+1) = k*E -
-  # k*I_n has multiplier -k instead of -1, which converges for k<1
-  # instead of oscillating forever. Trade-off: the self-balancing
-  # equilibrium settles at a fraction of the theoretical max surplus
-  # usage rather than the full amount -- the price of stability without
-  # a PID controller.
-  # NOTE: TWC3's own minimum charge current is 5A -- too low a gain shrinks
-  # the aggregate target (target = pool/3, which absorbs the SAME gain as
-  # every strict_x feeding into it) below that floor and charging never
-  # starts at all (confirmed live: gain=0.5 -> target=3.5A on a phase
-  # that would've gotten 7A ungained -> never started).
-  #
-  # 0.75 (confirmed live, combined with the escalation_timeout_ms raise
-  # below) starts and keeps charging without stopping, but leaves a visible
-  # residual oscillation (~12-16A) during steady-state draw.
-  #
-  # 0.65 (also confirmed live) damps that residual oscillation down to
-  # brief, self-recovering blips on a real load transient (an appliance
-  # switching on) and otherwise holds steady -- but leaves noticeably more
-  # surplus unused at equilibrium (E/(1+k) grows as k shrinks: even *zero*
-  # damping, k=1, already leaves E/2 unused -- this self-referential loop
-  # structurally never uses 100% of the surplus, gain reduction just makes
-  # that worse). Observed: ~1300-2000W of real surplus sitting unused.
-  #
-  # Back to 0.75: the start/stop cycling seen at 0.75 originally was root-
-  # caused to escalation_timeout_ms being too short for the startup
-  # transient (see below), NOT the gain itself -- once that was fixed,
-  # 0.75 ran stably too. Since 0.75 was confirmed stable independent of the
-  # gain-vs-oscillation trade-off, prefer it over 0.65 for less wasted
-  # surplus (~2A more charge current), accepting the larger (but
-  # non-fatal, self-bounded) residual oscillation during steady-state draw.
-  self_balance_gain: "0.75"
+  # excess_gain: compresses how much of the raw over-limit amount actually
+  # gets published, once ALREADY above the limit -- never applied below
+  # it (see above).
+  excess_gain: "0.75"
+  # excess_max_a: hard ceiling on how far "reported" climbs past
+  # twc_breaker_limit_a via this compression -- kept close to (not below)
+  # the confirmed ~1.1-1.2A reaction margin, so the law can actually reach
+  # the point TWC3 reacts to without needlessly overshooting further.
+  excess_max_a: "1.2"
+  # law_nudge_min_a: floor on the compressed excess whenever above the
+  # limit at all -- matches the reference project's own minimum nudge.
+  law_nudge_min_a: "0.1"
+  # desired_avail_slew_a_per_s: max rate of change allowed for
+  # desired_avail (our "budget"/target-setting term) per second. In the
+  # reference project, "budget" is a fixed/slow-changing external quantity
+  # (contract limit) or, when made dynamic via their HA orchestration
+  # layer, explicitly rate-limited there (10s tick, <=0.5A/tick decay) --
+  # kept separate from the FAST worst-phase tracking that needs 1:1
+  # correlation. Our desired_avail was instead recomputed from raw live
+  # Shelly/vitals data every fast cycle, with no such separation.
+  # Confirmed live: Shelly and TWC3's own vitals API are two
+  # independently-polled sources that can briefly disagree by several
+  # amps during a fast multi-phase engagement (vitals lagging behind a
+  # newly-engaged phase's real draw) -- this fed straight into
+  # desired_avail, spiking o_raw/pub right at the critical startup
+  # window and appears to have caused TWC3 to abort the session. Slew-
+  # limiting desired_avail keeps it a genuinely slow-moving operating
+  # point again, absorbing sub-second desync noise from either source
+  # while still tracking real, sustained solar/household changes over
+  # seconds just fine.
+  desired_avail_slew_a_per_s: "1.0"
+  # dither: small always-on alternation so "reported" is never perfectly
+  # static for long, even at rest/fail-safe -- a genuinely static value
+  # was independently identified (both by us and by the reference
+  # project) as a distrust-latch risk.
+  dither_amplitude_a: "0.05"
 
-  # Confirmed live: raising this from 30000 (30s) fixed the start/stop
-  # cycling -- the gain-reduced self-balancing loop was touching the
-  # reported=twc_breaker_limit_a ceiling briefly during a session's
-  # startup transient (before it settles), and 30s was long enough for
-  # that transient alone to trigger this escalation, forcing a hard stop
-  # right after every start.
+  # --- Anti-glitch firewall (per-phase real current, see the on_value
+  #     handlers below) -- ASYMMETRIC per the reference project: a RISE
+  #     (or a gentle drop within glitch_drop_a) is trusted immediately
+  #     (zero latency); a SUDDEN drop >= glitch_drop_a is held at the last
+  #     trusted value until 2 consecutive samples agree on a new value
+  #     within glitch_confirm_tol_a of each other. Confirmed live: a
+  #     single stale/desynced Shelly sample dropped >4A in <10ms right
+  #     during a fast multi-phase engagement (physically impossible for a
+  #     real ramp), producing a nonsensical household value that
+  #     destabilized "reported" during exactly the critical startup
+  #     window. ---
+  glitch_drop_a: "3.0"
+  glitch_confirm_tol_a: "1.0"
+
+  # Escalation (secondary safety net, underneath the publication law
+  # above) -- a 2-stage STEP function (per the reference project, not a
+  # continuous ramp): if o_raw stays above twc_breaker_limit_a
+  # continuously for escalation_timeout_ms, force reported up to at least
+  # the law's own minimum nudge; if it's STILL there after
+  # 2*escalation_timeout_ms, force it up to escalation_kick_a -- a harder
+  # kick, safely past the confirmed ~1.1-1.2A reaction margin.
   escalation_timeout_ms: "120000"
+  escalation_kick_a: "1.5"
 
   # HA entity IDs (live in secrets.yaml, not published -- entity IDs can
   # reveal LAN/device naming and household setup)
@@ -104,6 +136,14 @@ substitutions:
   ha_power_b_entity: !secret ha_power_b_entity
   ha_power_c_entity: !secret ha_power_c_entity
   ha_charge_from_grid_entity: !secret ha_charge_from_grid_entity
+
+  # --- TWC3's own local vitals API (diagnostic only, does not drive
+  #     control) -- ground-truth of what TWC3 is actually doing
+  #     (currentA/B/C_a, vehicle_current_a, contactor_closed), independent
+  #     of Shelly/HA, for correlating against "reported" and Shelly's real
+  #     currents while tuning the control algorithm. ---
+  twc_vitals_ip: !secret twc_vitals_ip
+  twc_vitals_poll_interval: "2000ms"
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -130,13 +170,24 @@ api:
     key: !secret api_encryption_key
   # Watchdog: without an HA connection we can't trust the mirrored
   # charge_from_grid either (it could be a stale value) -> fail-safe to 0A.
+  #
+  # IMPORTANT: on_client_connected/disconnected fire for EVERY API client,
+  # not just HA -- a diagnostic `esphome logs` session is a second client.
+  # Naively setting ha_api_connected straight from the callback meant any
+  # logs session disconnecting (e.g. a timeout) incorrectly tripped
+  # fail-safe even while HA's own connection was still up -- confirmed
+  # live (reported pinned at the breaker limit right when a logs session
+  # ended). Track a client COUNT instead: only false once the last
+  # connected client (of any kind) actually disconnects.
   on_client_disconnected:
     - lambda: |-
-        ESP_LOGW("watchdog", "API client '%s' disconnected, fail-safe to 0A", client_info.c_str());
-        id(ha_api_connected) = false;
+        if (id(api_client_count) > 0) id(api_client_count)--;
+        ESP_LOGW("watchdog", "API client '%s' disconnected (%d remaining)", client_info.c_str(), id(api_client_count));
+        id(ha_api_connected) = (id(api_client_count) > 0);
     - script.execute: recompute_ct
   on_client_connected:
     - lambda: |-
+        id(api_client_count)++;
         id(ha_api_connected) = true;
     - logger.log:
         format: "API client '%s' connected from %s"
@@ -156,6 +207,11 @@ wifi:
     ssid: "${friendly_name} Fallback"
     password: !secret ap_password
 
+# Direct poll of TWC3's own /api/1/vitals -- diagnostic ground-truth only,
+# does not participate in control (see interval: below).
+http_request:
+  timeout: 2s
+
 # ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
@@ -164,6 +220,13 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"      # safe startup: 0A available until HA confirms the connection
+  # How many API clients (HA + any diagnostic `esphome logs` sessions,
+  # etc.) are currently connected -- see api.on_client_connected/
+  # disconnected above. ha_api_connected only goes false once this hits 0.
+  - id: api_client_count
+    type: int
+    restore_value: no
+    initial_value: "0"
 
   - id: ct1_current_a
     type: float
@@ -216,6 +279,51 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  # --- Escalation log-once guards (secondary safety net, see recompute_ct)
+  #     -- 2-stage step function, so each stage's warning should only log
+  #     once per transition, not on every qualifying recompute cycle. ---
+  - id: escalation_stage1_logged
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: escalation_stage2_logged
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # --- desired_avail slew-rate limiter state (see
+  #     desired_avail_slew_a_per_s above). ---
+  - id: desired_avail_prev
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: desired_avail_last_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # --- TWC3's own vitals (diagnostic only, see twc_vitals_ip above) ---
+  - id: twc_vitals_current_a
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: twc_vitals_current_b
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: twc_vitals_current_c
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: twc_vitals_vehicle_current
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: twc_vitals_contactor_closed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
   # --- Real per-phase current/power (Shelly Pro 3EM on the main incomer,
   #     includes the TWC branch too), mirrored in from HA entities --
   #     see "sensor: platform: homeassistant" below. ---
@@ -231,6 +339,56 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
+
+  # --- Anti-glitch firewall state, per phase (see glitch_drop_a above and
+  #     the glitch guard in each ha_current_a/b/c on_value handler below).
+  #     ASYMMETRIC: a rise (or a gentle drop within glitch_drop_a) updates
+  #     "trusted" immediately; a sudden drop >= glitch_drop_a is held at
+  #     the last trusted value until 2 consecutive samples agree on a new
+  #     value within glitch_confirm_tol_a of each other (pending_drop/
+  #     confirm_count track that in-progress confirmation). Confirmed
+  #     live: a single stale/desynced Shelly sample dropped >4A in <10ms
+  #     right during a fast multi-phase engagement (physically impossible
+  #     for a real ramp), producing a nonsensical household value that
+  #     destabilized "reported" during exactly the critical startup
+  #     window and appears to have caused TWC3 to abort the session
+  #     (contactor opened) rather than just throttle. ---
+  - id: real_a_trusted
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: real_a_pending_drop
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: real_a_confirm_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: real_b_trusted
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: real_b_pending_drop
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: real_b_confirm_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: real_c_trusted
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: real_c_pending_drop
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: real_c_confirm_count
+    type: int
+    restore_value: no
+    initial_value: "0"
   # act_power: negative = export to grid, positive = import from grid (straight from Shelly)
   - id: shelly_a_power
     type: float
@@ -291,34 +449,40 @@ globals:
     initial_value: "0"
 
 # ---------------------------------------------------------------------------
-# Two breakers protected at once -- the TWC sub-breaker (twc_breaker_limit_a)
-# and the main incomer breaker (main_breaker_limit_a), both measured and
-# protected simultaneously through a single "avail".
+# Publication law -- see "Publication law" comment block in substitutions
+# above for the full design rationale (adapted from
+# https://github.com/zany92/tesla-loadpilot, confirmed against our own
+# empirical TWC3 FW 26.26.1 testing). Summary:
 #
-# IMPORTANT: TWC3 internally compares "reported" against ITS OWN configured
-# limit (twc_breaker_limit_a, e.g. 16A) -- that is the only "breaker" TWC
-# knows about. To also protect the (higher) main breaker through this same
-# channel, we have to cap availability upfront to whichever of the two is
-# lower:
+#   desired_avail = <self-balancing target, from HOUSEHOLD-ONLY signal --
+#                     TWC3's own vitals API gives us the car's OWN current
+#                     directly, subtracted out of Shelly's combined
+#                     reading, so this has NO self-referential feedback
+#                     and needs no gain damping at all>
+#   worst         = max(signed_a, signed_b, signed_c)   (car-INCLUSIVE,
+#                     for live 1:1 correlation below the limit)
+#   bias_offset   = twc_breaker_limit_a - desired_avail
+#   o_raw         = worst + bias_offset
+#   pub           = o_raw <= limit ? o_raw
+#                     : limit + clamp(excess_gain*(o_raw-limit), 0.1, excess_max_a)
+#   pub           = max(pub, <car's own measured current, from vitals>)
+#   pub          += tail (decaying anti-oscillation bias) + dither
+#   reported_a = reported_b = reported_c = pub   (published SYMMETRICALLY
+#                     on all 3 registers -- makes min=mean=max, so TWC3's
+#                     own service loop engages at the true constraint
+#                     regardless of which phase is actually weakest)
 #
-#   avail_main = main_breaker_limit_a - real   (protects the main breaker)
-#   avail_mode = grid_mode ? twc_breaker_limit_a : -signed_current
-#   avail      = min(avail_mode, twc_breaker_limit_a, avail_main)
-#   reported   = twc_breaker_limit_a - avail
+# Both breakers (twc_breaker_limit_a AND main_breaker_limit_a) still
+# clamp desired_avail before any of the above, protecting both
+# simultaneously regardless of mode.
 #
-# GRID mode (charge_from_grid = ON): the car gets the max allowed by
-# whichever breaker is lower (normally twc_breaker_limit_a, unless the main
-# breaker is otherwise loaded).
+# GRID mode: desired_avail = twc_breaker_limit_a (max allowed, subject to
+# the same breaker clamps).
 #
-# FVE-only mode (charge_from_grid = OFF, "FVE" = PV/solar-only): a
-# self-balancing loop toward zero grid exchange (avail_mode =
-# -signed_current, export=negative/import=positive per act_power), still
-# bounded by both breakers.
-#
-# avail is clamped against both breakers AND floored at 0, so "reported"
-# never exceeds twc_breaker_limit_a even under overload/import -- testing
-# whether TWC3 reacts better to a hard cap at "0 available" than to values
-# above its own configured limit.
+# FVE mode: desired_avail is the self-balancing target -- averaged across
+# phases (aggregate/net billing) or the weakest phase (per-phase billing),
+# both from the household-only (car-free) signal, plus the manual
+# fve_offset_kw (number.*_fve_offset in HA).
 #
 # If the HA charge_from_grid entity doesn't have a valid state yet, we
 # safely fall back to GRID mode (more conservative, proven to work).
@@ -335,6 +499,13 @@ script:
           const float twc_breaker = ${twc_breaker_limit_a};
           const float main_breaker = ${main_breaker_limit_a};
           const float voltage = 230.0f;
+          const uint32_t now_ms = millis();
+
+          // Dither -- see dither_amplitude_a above -- computed once,
+          // applied everywhere below (including fail-safe/disabled) so
+          // "reported" is never perfectly static for long.
+          const float dither = ((now_ms / 500) % 2 == 0)
+              ? (float)${dither_amplitude_a} : -((float)${dither_amplitude_a});
 
           // Availability is HA's own signal (see the on_value lambdas
           // below), not a fixed no-update timeout -- debounced so a brief
@@ -345,12 +516,12 @@ script:
               id(ha_current_c_available) && id(ha_power_a_available) &&
               id(ha_power_b_available) && id(ha_power_c_available);
           if (!all_available) {
-            if (id(shelly_unavailable_since_ms) == 0) id(shelly_unavailable_since_ms) = millis();
+            if (id(shelly_unavailable_since_ms) == 0) id(shelly_unavailable_since_ms) = now_ms;
           } else {
             id(shelly_unavailable_since_ms) = 0;
           }
           bool shelly_stale = (id(shelly_unavailable_since_ms) != 0) &&
-              (millis() - id(shelly_unavailable_since_ms) >= (uint32_t)${shelly_unavailable_debounce_ms});
+              (now_ms - id(shelly_unavailable_since_ms) >= (uint32_t)${shelly_unavailable_debounce_ms});
 
           bool grid_mode = true;
           if (id(charge_from_grid).has_state()) {
@@ -359,139 +530,184 @@ script:
 
           float reported_a, reported_b, reported_c;
           if (!id(twc_control_enabled).state) {
-            // Deliberately report a constant 0A (max availability) on all
-            // 3 phases instead of computing anything live. TWC3's live
-            // correlation check (see the aggregate-metering design history
-            // below) then distrusts this static value within seconds of a
-            // session starting and falls back to its own internal ceiling
-            // -- i.e. it ends up ignoring us entirely and charges at
-            // whatever it decides on its own, effectively disabling this
-            // whole external control loop on purpose.
-            reported_a = reported_b = reported_c = 0.0f;
+            // Deliberately report ~0A (max availability) on all 3 phases
+            // instead of computing anything live. TWC3's live correlation
+            // check then distrusts this within seconds of a session
+            // starting and falls back to its own internal ceiling -- i.e.
+            // it ends up ignoring us entirely and charges at whatever it
+            // decides on its own, effectively disabling this whole
+            // external control loop on purpose.
+            reported_a = reported_b = reported_c = 0.0f + dither;
             id(capped_since_ms) = 0;
+            id(escalation_stage1_logged) = false;
+            id(escalation_stage2_logged) = false;
           } else if (shelly_stale || !id(ha_api_connected)) {
             ESP_LOGW("shelly", "Shelly stale or HA API disconnected, fail-safe to 0A");
-            reported_a = reported_b = reported_c = twc_breaker;
+            reported_a = reported_b = reported_c = twc_breaker + dither;
           } else {
+            // shelly_a/b/c_current already hold the anti-glitch-filtered
+            // trusted value -- see the on_value handlers below (filtering
+            // happens once, at the point a genuinely new HA sample
+            // arrives, not on every recompute_ct call).
             float real_a = id(shelly_a_current);
             float real_b = id(shelly_b_current);
             float real_c = id(shelly_c_current);
 
-            float avail_mode_a, avail_mode_b, avail_mode_c;
-            if (grid_mode) {
-              avail_mode_a = twc_breaker;
-              avail_mode_b = twc_breaker;
-              avail_mode_c = twc_breaker;
-            } else if (id(aggregate_balance_metering).state) {
-              // Aggregate/net metering: your utility nets import/export
-              // across all 3 phases together for billing. TWC3 applies a
-              // SINGLE current to all connected phases and is bottlenecked
-              // by whichever phase's register shows the least availability
-              // -- so an uneven per-phase split (one weak/importing phase)
-              // can block or badly under-use charging even while the whole
-              // house is net-exporting plenty.
-              //
-              // IMPORTANT: a plain phase-average (report the same blended
-              // value on all 3 registers) broke TWC3's live correlation
-              // check (it compares its own actual ramping current against
-              // the reported value) -- averaging diluted a ramping phase's
-              // signal to ~1/3 of its real slope, so TWC3 saw a mismatch
-              // and stopped charging within seconds.
-              //
-              // Fix: each phase's own real current stays the FULL,
-              // undiluted base term (1:1 correlation, same formula as the
-              // per-phase branch below) -- credit only ever ADDS on top,
-              // never replaces it, so the underlying 1:1 tracking survives
-              // for any phase that doesn't need help.
-              //
-              // An even 1/3-of-pool split (tried first) preserved
-              // correlation but wasted most of the surplus: TWC3 is
-              // bottlenecked by whichever phase is LOWEST, so headroom
-              // handed to already-strong phases is unused.
-              //
-              // Water-filling (tried next, all the way up to the strongest
-              // phase's own value) was a real bug, not just an
-              // over-optimization: TWC3 applies I = min(avail_a, avail_b,
-              // avail_c) as the SAME current on all 3 phases, so total car
-              // power = 3*I. Keeping every phase's own strict_x untouched
-              // while ALSO spending the full pool again on top of it
-              // double-counted the surplus -- e.g. pool=23A water-filled to
-              // min=15.33A implies 3*15.33=46A of power, double the real
-              // 23A available.
-              //
-              // Correct target: for the whole house to stay net-export/zero
-              // in aggregate, 3*I <= pool, i.e. I <= pool/3. That's the
-              // exact ceiling -- no more, no less -- so a phase already
-              // above pool/3 is left alone (1:1 correlation, no dilution),
-              // and a phase below pool/3 is raised exactly up to it (never
-              // higher), so the resulting min(avail) lands exactly on
-              // pool/3 and the true available surplus is fully used with
-              // no double-counting.
-              // Loop-gain reduction (see self_balance_gain above) applied
-              // right at the source -- pool/target inherit it automatically
-              // since they're a linear combination of strict_a/b/c.
-              const float gain = ${self_balance_gain};
-              float strict_a = gain * ((id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a);
-              float strict_b = gain * ((id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b);
-              float strict_c = gain * ((id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c);
+            // Manual export-balance offset -- runtime-adjustable from HA
+            // (number.*_fve_offset, see below), symmetric across phases.
+            // GRID mode ignores it (uses the main-breaker headroom
+            // instead). NAN-guarded in case the entity hasn't restored a
+            // value yet (falls back to 0 = no offset).
+            float fve_offset_kw = id(fve_offset).state;
+            if (std::isnan(fve_offset_kw)) fve_offset_kw = 0.0f;
+            const float fve_offset_a = fve_offset_kw * 1000.0f / 3.0f / voltage;
 
-              // Only ever a reward (net-export target), never an extra
-              // penalty -- on net import overall this is 0 and behavior is
-              // identical to plain per-phase FVE mode.
-              float pool = strict_a + strict_b + strict_c;
-              float target = (pool > 0.0f) ? (pool / 3.0f) : -1.0f;   // -1 = never wins the max() below
+            // Signed net grid exchange per phase (positive = import,
+            // negative = export) -- floored down only on the export side,
+            // so a claimed surplus never slightly overshoots what's real.
+            float signed_a = (id(shelly_a_power) < 0.0f) ? -floorf(real_a) : real_a;
+            float signed_b = (id(shelly_b_power) < 0.0f) ? -floorf(real_b) : real_b;
+            float signed_c = (id(shelly_c_power) < 0.0f) ? -floorf(real_c) : real_c;
 
-              avail_mode_a = std::max(strict_a, target);
-              avail_mode_b = std::max(strict_b, target);
-              avail_mode_c = std::max(strict_c, target);
-            } else {
-              // Per-phase (default): each phase reacts only to its own
-              // export/import. Export case: round the offered current DOWN
-              // to a whole amp before it feeds into "reported" -- better to
-              // slightly under-use the surplus than overshoot into an
-              // actual import. Import case: no rounding, use the precise
-              // value. Loop-gain reduction (see self_balance_gain above)
-              // applied on top -- same oscillation-vs-max-utilization
-              // trade-off as the aggregate branch.
-              const float gain = ${self_balance_gain};
-              avail_mode_a = gain * ((id(shelly_a_power) < 0.0f) ? floorf(real_a) : -real_a);
-              avail_mode_b = gain * ((id(shelly_b_power) < 0.0f) ? floorf(real_b) : -real_b);
-              avail_mode_c = gain * ((id(shelly_c_power) < 0.0f) ? floorf(real_c) : -real_c);
+            // R1 hard floor, applied to the INPUT signal (per the
+            // reference project -- not patched onto the output
+            // afterward): with the contactor closed, every phase carries
+            // at least the vehicle's own measured current on that branch
+            // -- a lower reading is physically impossible and (per the
+            // reference project) latches TWC3's distrust state.
+            if (id(twc_vitals_contactor_closed)) {
+              signed_a = std::max(signed_a, id(twc_vitals_current_a));
+              signed_b = std::max(signed_b, id(twc_vitals_current_b));
+              signed_c = std::max(signed_c, id(twc_vitals_current_c));
             }
 
-            // protects the main breaker (independent of mode)
+            // Household-only signal: TWC3's own vitals API gives us the
+            // car's OWN per-phase current directly (twc_vitals_current_a/
+            // b/c, see above), so it can be subtracted straight out of
+            // Shelly's combined reading -- unlike gain damping (which
+            // blunts the WHOLE signal to fight the self-referential
+            // feedback loop), this removes the self-reference at its
+            // actual source. Falls back to the car-inclusive signal
+            // (0.0 default) if vitals hasn't reported yet -- less
+            // precise, still correct.
+            float household_a = signed_a - id(twc_vitals_current_a);
+            float household_b = signed_b - id(twc_vitals_current_b);
+            float household_c = signed_c - id(twc_vitals_current_c);
+
+            // Desired available current -- how much we WANT the car
+            // allowed, from the car-free household signal (no feedback
+            // loop, no gain needed here at all).
+            float desired_avail;
+            if (grid_mode) {
+              desired_avail = twc_breaker;
+            } else if (id(aggregate_balance_metering).state) {
+              // Aggregate/net billing: utility nets import/export across
+              // all 3 phases together, so average the household-only
+              // availability across all 3.
+              desired_avail = ((-household_a + fve_offset_a) +
+                                (-household_b + fve_offset_a) +
+                                (-household_c + fve_offset_a)) / 3.0f;
+            } else {
+              // Per-phase billing: the weakest phase is the true
+              // constraint.
+              desired_avail = std::min(std::min(-household_a + fve_offset_a,
+                                                 -household_b + fve_offset_a),
+                                        -household_c + fve_offset_a);
+            }
+            desired_avail = std::min(desired_avail, twc_breaker);
+
+            // Slew-rate limit desired_avail (see desired_avail_slew_a_per_s
+            // above) BEFORE the main-breaker clamp -- that clamp is a hard
+            // safety limit and must react instantly/unslowed; only the
+            // soft, solar/household-derived target gets smoothed.
+            {
+              const float slew_a_per_s = ${desired_avail_slew_a_per_s};
+              float elapsed_s = (now_ms - id(desired_avail_last_update_ms)) / 1000.0f;
+              float max_delta = slew_a_per_s * std::max(elapsed_s, 0.001f);
+              float delta = desired_avail - id(desired_avail_prev);
+              delta = std::max(-max_delta, std::min(max_delta, delta));
+              desired_avail = id(desired_avail_prev) + delta;
+              id(desired_avail_prev) = desired_avail;
+              id(desired_avail_last_update_ms) = now_ms;
+            }
+
+            // Main breaker protection, applied AFTER slewing -- instant,
+            // never delayed, regardless of mode.
             float avail_main_a = main_breaker - real_a;
             float avail_main_b = main_breaker - real_b;
             float avail_main_c = main_breaker - real_c;
+            float avail_main_min = std::min(std::min(avail_main_a, avail_main_b), avail_main_c);
+            desired_avail = std::min(desired_avail, avail_main_min);
 
-            // Floored at 0 -> reported never exceeds twc_breaker_limit_a
-            // (16A cap), instead of climbing further under overload/import.
-            // Testing whether TWC3 reacts better to a hard-capped "0
-            // available" than to values above its own configured limit.
-            float avail_a = std::max(std::min(std::min(avail_mode_a, twc_breaker), avail_main_a), 0.0f);
-            float avail_b = std::max(std::min(std::min(avail_mode_b, twc_breaker), avail_main_b), 0.0f);
-            float avail_c = std::max(std::min(std::min(avail_mode_c, twc_breaker), avail_main_c), 0.0f);
+            // Publication law -- see the comment block above script: for
+            // the full design (adapted from
+            // https://github.com/zany92/tesla-loadpilot). worst-phase,
+            // car-INCLUSIVE signal for live 1:1 correlation below the
+            // limit; compressed-and-capped excess above it; published
+            // SYMMETRICALLY on all 3 registers.
+            float worst = std::max(std::max(signed_a, signed_b), signed_c);
+            float bias_offset = twc_breaker - desired_avail;
+            float o_raw = worst + bias_offset;
 
-            reported_a = twc_breaker - avail_a;
-            reported_b = twc_breaker - avail_b;
-            reported_c = twc_breaker - avail_c;
+            float pub;
+            if (o_raw <= twc_breaker) {
+              pub = o_raw;
+            } else {
+              float excess = std::min(((float)${excess_gain}) * (o_raw - twc_breaker), (float)${excess_max_a});
+              excess = std::max(excess, (float)${law_nudge_min_a});
+              pub = twc_breaker + excess;
+            }
 
-            // Escalation: TWC3 ramps down very slowly (observed: minutes)
-            // toward a sustained "0A available" (reported == twc_breaker)
-            // on all 3 phases, and even after ramping down to a few amps
-            // may keep drawing that residual current indefinitely despite
-            // continued import instead of stopping. If all 3 phases have
-            // been pinned at the full breaker limit for escalation_timeout_ms+
-            // straight, nudge reported 0.1A past the limit to force a hard stop.
-            bool fully_capped = (avail_a <= 0.0f && avail_b <= 0.0f && avail_c <= 0.0f);
-            if (fully_capped) {
-              if (id(capped_since_ms) == 0) id(capped_since_ms) = millis();
-              if (millis() - id(capped_since_ms) >= (uint32_t)${escalation_timeout_ms}) {
-                ESP_LOGW("shelly", "Reported current pinned at breaker limit for escalation_timeout_ms+, escalating to force a hard stop");
-                reported_a = reported_b = reported_c = twc_breaker + 0.1f;
+            pub += dither;
+
+            reported_a = reported_b = reported_c = pub;
+
+            // DIAGNOSTIC: single-line summary of every decisive value
+            // each recompute cycle, for live monitoring via
+            // `esphome logs` instead of only reconstructing after the
+            // fact from HA history graphs.
+            {
+              const char *mode_str = grid_mode ? "GRID" :
+                  (id(aggregate_balance_metering).state ? "AGG" : "PERPHASE");
+              ESP_LOGI("shelly",
+                  "[%s] real=%.2f/%.2f/%.2f signed=%.2f/%.2f/%.2f household=%.2f/%.2f/%.2f desired_avail=%.2f worst=%.2f o_raw=%.2f pub=%.2f offset=%.2fkW vitals=%.2f/%.2f/%.2f(veh=%.2f,%s)",
+                  mode_str, real_a, real_b, real_c,
+                  signed_a, signed_b, signed_c,
+                  household_a, household_b, household_c,
+                  desired_avail, worst, o_raw, pub, fve_offset_kw,
+                  id(twc_vitals_current_a), id(twc_vitals_current_b), id(twc_vitals_current_c),
+                  id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? "closed" : "open");
+            }
+
+            // Escalation (secondary safety net): a 2-stage STEP function
+            // (per the reference project, not a continuous ramp). If
+            // o_raw stays above twc_breaker_limit_a continuously for
+            // escalation_timeout_ms, force reported up to at least
+            // law_nudge_min_a past the limit; if it's STILL there after
+            // 2*escalation_timeout_ms, force it up to escalation_kick_a
+            // -- a harder kick, safely past the confirmed ~1.1-1.2A
+            // reaction margin.
+            if (o_raw > twc_breaker) {
+              if (id(capped_since_ms) == 0) id(capped_since_ms) = now_ms;
+              uint32_t capped_for = now_ms - id(capped_since_ms);
+              if (capped_for >= (uint32_t)${escalation_timeout_ms}) {
+                reported_a = reported_b = reported_c = std::max(pub, twc_breaker + (float)${law_nudge_min_a});
+                if (!id(escalation_stage1_logged)) {
+                  ESP_LOGW("shelly", "o_raw above limit for escalation_timeout_ms+, forcing past the limit");
+                  id(escalation_stage1_logged) = true;
+                }
+              }
+              if (capped_for >= 2u * (uint32_t)${escalation_timeout_ms}) {
+                reported_a = reported_b = reported_c = std::max(reported_a, twc_breaker + (float)${escalation_kick_a});
+                if (!id(escalation_stage2_logged)) {
+                  ESP_LOGW("shelly", "Still above limit after 2x escalation_timeout_ms, escalation_kick_a");
+                  id(escalation_stage2_logged) = true;
+                }
               }
             } else {
               id(capped_since_ms) = 0;
+              id(escalation_stage1_logged) = false;
+              id(escalation_stage2_logged) = false;
             }
           }
 
@@ -531,22 +747,54 @@ switch:
 
   # FVE mode only. When your utility nets import/export across all 3 phases
   # together (aggregate/net billing) rather than settling each phase
-  # separately, TWC3 being bottlenecked by its single weakest/importing
-  # phase (even while other phases export a lot more) is overly
-  # conservative. When this is on, FVE mode still reports each phase's OWN
-  # real current as the base (required for TWC3's live correlation check --
-  # see recompute_ct), then raises any phase below pool/3 (the whole-house
-  # net surplus divided by 3, the exact ceiling for TWC3's single applied
-  # current across all 3 phases) up to that target -- never higher, so the
-  # real surplus is used in full with no double-counting. The per-phase
-  # main-breaker safety check still applies underneath it regardless of
-  # this setting.
+  # separately, this averages the household-only (car-free) availability
+  # across all 3 phases as the self-balancing target (desired_avail), instead
+  # of using the single weakest phase -- see recompute_ct's publication law.
+  # Note: "reported" is always published symmetrically on all 3 registers
+  # regardless of this setting (required for TWC3's own service loop to
+  # engage at the true constraint) -- this switch only changes how
+  # desired_avail itself is computed. The per-phase main-breaker safety
+  # check still applies underneath it regardless of this setting.
   - platform: template
     id: aggregate_balance_metering
     name: "Aggregate Balance Metering"
     icon: "mdi:swap-horizontal-circle-outline"
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
+
+# ---------------------------------------------------------------------------
+# Runtime-adjustable manual export-balance offset (FVE modes only, see
+# recompute_ct). Symmetric across all 3 phases, in kW total (split evenly
+# and converted to A internally), applied AFTER self_balance_gain -- direct,
+# undiminished A-for-A control, independent of the loop-stability gain.
+#
+# Positive: artificially IMPROVES the perceived balance -- lets charging
+# start/continue even when real production alone falls just short of what
+# TWC3's 5A minimum needs.
+# Negative: artificially WORSENS it -- reserves a buffer/margin of real
+# export that must never go to the car, even while genuinely exporting.
+# 0.0 (default) = no offset, unchanged behavior.
+#
+# Existing safety clamps (main_breaker_limit_a, twc_breaker_limit_a, floor
+# at 0) still apply downstream regardless of this value -- it can't be used
+# to bypass either breaker's protection, only to shift where the
+# self-balancing formula's own zero-point sits.
+# ---------------------------------------------------------------------------
+number:
+  - platform: template
+    id: fve_offset
+    name: "FVE Offset"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "kW"
+    min_value: -5.0
+    max_value: 5.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.0
+    on_value:
+      - script.execute: recompute_ct
 
 # ---------------------------------------------------------------------------
 # Safety-net recompute: recompute_ct is otherwise ONLY triggered by one of
@@ -563,6 +811,38 @@ interval:
     then:
       - script.execute: recompute_ct
 
+  # Direct poll of TWC3's own /api/1/vitals -- ground-truth diagnostic only
+  # (currentA/B/C_a, vehicle_current_a, contactor_closed), does not feed
+  # into recompute_ct or the control loop, purely for correlating against
+  # "reported" and Shelly's real currents.
+  - interval: ${twc_vitals_poll_interval}
+    then:
+      - http_request.get:
+          url: "http://${twc_vitals_ip}/api/1/vitals"
+          capture_response: true
+          on_response:
+            then:
+              - if:
+                  condition:
+                    lambda: "return response->status_code == 200;"
+                  then:
+                    - lambda: |-
+                        json::parse_json(body, [](JsonObject root) -> bool {
+                          if (root["currentA_a"].is<float>()) id(twc_vitals_current_a) = root["currentA_a"];
+                          if (root["currentB_a"].is<float>()) id(twc_vitals_current_b) = root["currentB_a"];
+                          if (root["currentC_a"].is<float>()) id(twc_vitals_current_c) = root["currentC_a"];
+                          if (root["vehicle_current_a"].is<float>()) id(twc_vitals_vehicle_current) = root["vehicle_current_a"];
+                          if (root["contactor_closed"].is<bool>()) id(twc_vitals_contactor_closed) = root["contactor_closed"];
+                          return true;
+                        });
+                        ESP_LOGI("vitals", "TWC vitals: A=%.2f B=%.2f C=%.2f vehicle=%.2f contactor=%s",
+                            id(twc_vitals_current_a), id(twc_vitals_current_b), id(twc_vitals_current_c),
+                            id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? "closed" : "open");
+                  else:
+                    - logger.log:
+                        format: "TWC vitals HTTP error: %d"
+                        args: ["response->status_code"]
+
 # ---------------------------------------------------------------------------
 # HA diagnostics -- "connected" reflects the actual API connection to HA
 # (not the time of the last value change), see api.on_client_disconnected above.
@@ -571,6 +851,12 @@ binary_sensor:
   - platform: status
     name: "TWC HA Link OK"
     id: ha_link_ok
+
+  # --- TWC3's own vitals, ground-truth diagnostic (see twc_vitals_ip above) ---
+  - platform: template
+    name: "TWC Vitals Contactor Closed"
+    device_class: running
+    lambda: "return id(twc_vitals_contactor_closed);"
 
   # --- Is TWC3 currently active (charging/session running and polling regularly)? ---
   - platform: template
@@ -601,6 +887,43 @@ binary_sensor:
       - script.execute: recompute_ct
 
 sensor:
+  # --- TWC3's own vitals, ground-truth diagnostic (see twc_vitals_ip above) ---
+  - platform: template
+    name: "TWC Vitals Current L1"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: "return id(twc_vitals_current_a);"
+
+  - platform: template
+    name: "TWC Vitals Current L2"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: "return id(twc_vitals_current_b);"
+
+  - platform: template
+    name: "TWC Vitals Current L3"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: "return id(twc_vitals_current_c);"
+
+  - platform: template
+    name: "TWC Vitals Vehicle Current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: "return id(twc_vitals_vehicle_current);"
+
   # ---------------------------------------------------------------------------
   # Real per-phase current/power, mirrored in from HA entities (Shelly Pro 3EM
   # integration in HA) instead of polling Shelly's HTTP API directly. Avoids
@@ -630,7 +953,32 @@ sensor:
               ESP_LOGW("shelly", "%s reported unavailable", "${ha_current_a_entity}");
               id(ha_current_a_available) = false;
             } else {
-              id(shelly_a_current) = x;
+              // Anti-glitch (asymmetric, see glitch_drop_a above): a rise
+              // (or a gentle drop) is trusted immediately; a sudden drop
+              // needs 2 consecutive samples to agree before being
+              // believed (confirmed live: a single stale/desynced sample
+              // dropped >4A in <10ms, physically impossible for a real
+              // ramp).
+              const float drop_a = ${glitch_drop_a};
+              const float tol_a = ${glitch_confirm_tol_a};
+              if (x >= id(real_a_trusted) - drop_a) {
+                id(real_a_pending_drop) = NAN;
+                id(real_a_confirm_count) = 0;
+                id(real_a_trusted) = x;
+              } else {
+                if (std::isnan(id(real_a_pending_drop)) || fabsf(x - id(real_a_pending_drop)) > tol_a) {
+                  id(real_a_pending_drop) = x;
+                  id(real_a_confirm_count) = 1;
+                } else {
+                  id(real_a_confirm_count)++;
+                }
+                if (id(real_a_confirm_count) >= 2) {
+                  id(real_a_trusted) = std::min(x, id(real_a_pending_drop));
+                  id(real_a_pending_drop) = NAN;
+                  id(real_a_confirm_count) = 0;
+                }
+              }
+              id(shelly_a_current) = id(real_a_trusted);
               id(shelly_last_ok_ms) = millis();
               id(ha_current_a_available) = true;
             }
@@ -646,7 +994,27 @@ sensor:
               ESP_LOGW("shelly", "%s reported unavailable", "${ha_current_b_entity}");
               id(ha_current_b_available) = false;
             } else {
-              id(shelly_b_current) = x;
+              // Anti-glitch -- see ha_current_a's on_value above.
+              const float drop_a = ${glitch_drop_a};
+              const float tol_a = ${glitch_confirm_tol_a};
+              if (x >= id(real_b_trusted) - drop_a) {
+                id(real_b_pending_drop) = NAN;
+                id(real_b_confirm_count) = 0;
+                id(real_b_trusted) = x;
+              } else {
+                if (std::isnan(id(real_b_pending_drop)) || fabsf(x - id(real_b_pending_drop)) > tol_a) {
+                  id(real_b_pending_drop) = x;
+                  id(real_b_confirm_count) = 1;
+                } else {
+                  id(real_b_confirm_count)++;
+                }
+                if (id(real_b_confirm_count) >= 2) {
+                  id(real_b_trusted) = std::min(x, id(real_b_pending_drop));
+                  id(real_b_pending_drop) = NAN;
+                  id(real_b_confirm_count) = 0;
+                }
+              }
+              id(shelly_b_current) = id(real_b_trusted);
               id(shelly_last_ok_ms) = millis();
               id(ha_current_b_available) = true;
             }
@@ -662,7 +1030,27 @@ sensor:
               ESP_LOGW("shelly", "%s reported unavailable", "${ha_current_c_entity}");
               id(ha_current_c_available) = false;
             } else {
-              id(shelly_c_current) = x;
+              // Anti-glitch -- see ha_current_a's on_value above.
+              const float drop_a = ${glitch_drop_a};
+              const float tol_a = ${glitch_confirm_tol_a};
+              if (x >= id(real_c_trusted) - drop_a) {
+                id(real_c_pending_drop) = NAN;
+                id(real_c_confirm_count) = 0;
+                id(real_c_trusted) = x;
+              } else {
+                if (std::isnan(id(real_c_pending_drop)) || fabsf(x - id(real_c_pending_drop)) > tol_a) {
+                  id(real_c_pending_drop) = x;
+                  id(real_c_confirm_count) = 1;
+                } else {
+                  id(real_c_confirm_count)++;
+                }
+                if (id(real_c_confirm_count) >= 2) {
+                  id(real_c_trusted) = std::min(x, id(real_c_pending_drop));
+                  id(real_c_pending_drop) = NAN;
+                  id(real_c_confirm_count) = 0;
+                }
+              }
+              id(shelly_c_current) = id(real_c_trusted);
               id(shelly_last_ok_ms) = millis();
               id(ha_current_c_available) = true;
             }

@@ -23,6 +23,9 @@ Shelly Pro 3EM (main incomer, L1/L2/L3, includes the TWC branch)
    → ESP32 (sensor: platform: homeassistant, real-time push over the API connection)
    → globals shelly_a/b/c_current + shelly_a/b/c_power (signed, for flow direction)
 
+TWC3's own /api/1/vitals (twc_vitals_ip, polled directly, diagnostic AND
+   R1-floor/household-split input -- see "Publication law" below)
+
 HA input_boolean (entity ID set by ha_charge_from_grid_entity in secrets.yaml,
 mirrored via ESPHome's homeassistant: binary_sensor)
    → switches between two modes:
@@ -31,26 +34,99 @@ mirrored via ESPHome's homeassistant: binary_sensor)
   FVE mode (OFF):  self-balancing loop toward zero grid exchange
                    (export -> car takes more, import -> car backs off)
 
-ESP32 computation (see recompute_ct in twc-control.yaml):
-  avail_mode = per-phase or per-mode availability (see below)
-  avail      = clamp(min(avail_mode, twc_breaker_limit_a, main_breaker_limit_a - real), 0, ...)
-  reported   = twc_breaker_limit_a - avail
-   → RS485 Modbus RTU (registers 0xF4-0xFC)
+ESP32 computation (see recompute_ct in twc-control.yaml) -- a "publication
+law", not a proportional availability calculation, see below for why:
+  desired_avail = self-balancing target (household-only, car-free signal)
+  worst         = max(signed_a, signed_b, signed_c)  (car-INCLUSIVE)
+  o_raw         = worst + (twc_breaker_limit_a - desired_avail)
+  reported      = o_raw <= limit ? o_raw
+                    : limit + clamp(excess_gain*(o_raw-limit), law_nudge_min_a, excess_max_a)
+   → RS485 Modbus RTU (registers 0xF4-0xFC), published SYMMETRICALLY on all 3
    → TWC3 applies the limit to the car
 
 Cloud API (Tessie/Fleet, etc.): start/stop session only, independent of power control
 ```
 
-Two independent breakers protected at the same time, for every mode:
-- `twc_breaker_limit_a` — TWC's own sub-circuit breaker / internal Home Load
-  Management limit set in the Tesla installer menu (must match exactly!)
-- `main_breaker_limit_a` — the main incomer breaker, measured by Shelly
+### Publication law (why this isn't a simple availability formula)
 
-`avail` is clamped on **both** sides: from the top against `twc_breaker_limit_a`
-and `main_breaker_limit_a - real` (per-phase, always active regardless of
-mode), and from the bottom at `0` — so `reported` always stays within
-`[0, twc_breaker_limit_a]`, never a flat "0 available" for longer than
-actually needed and never an out-of-range value either.
+TWC3 firmware **26.26.1** does **not** proportionally track `reported` below
+its own configured breaker limit at all — confirmed live, repeatedly: it
+just charges toward its own internal ceiling regardless of what's reported,
+as long as that value stays under the limit. It only reacts once `reported`
+crosses the limit by a margin — confirmed live, consistently **~1.1-1.2A**
+above `twc_breaker_limit_a`, across independent trials and two different HA
+data sources. This ruled out the entire earlier "compute a precise
+available current" family of designs (see the numbered history further
+below, kept for context) — none of that fine-grained math has any effect
+on TWC3's actual behavior on this firmware version.
+
+The current design is adapted from an independently-developed, live-
+validated open-source solution to this identical TWC3 behavior:
+[zany92/tesla-loadpilot](https://github.com/zany92/tesla-loadpilot)
+(verified against its actual source, `esphome/packages/twc-core.yaml`, not
+just its docs — an earlier pass here mis-implemented a "decaying tail" its
+docs described that doesn't actually exist in the real code, and that bug
+is described further below as an example of why this was verified against
+source).
+
+- **Below the limit**: `reported` tracks the **worst-phase, car-inclusive**
+  real current 1:1 (`worst`) — no gain, no damping. TWC3 ignores the exact
+  value here for control purposes, but still needs to see it move in
+  lockstep with its own ramping current for its live plausibility check;
+  diluting that slope (tried and reverted, see history) risks a distrust
+  latch instead.
+- **`desired_avail`**: the self-balancing *target* — computed from the
+  **household-only** signal (TWC3's own vitals API gives the car's OWN
+  per-phase current directly, subtracted out of Shelly's combined reading,
+  eliminating the self-referential feedback loop at its source instead of
+  damping it) — and **slew-rate-limited** (`desired_avail_slew_a_per_s`,
+  default 1A/s). This mirrors the reference project's own architecture: its
+  "budget" is a slow/external quantity, kept separate from the fast
+  `worst` term used for correlation. Confirmed live: without this slew
+  limit, Shelly and TWC3's own vitals API — two independently-polled
+  sources — can briefly disagree by several amps during a fast multi-phase
+  engagement (one lagging the other's newly-engaged-phase reading),
+  spiking `reported` right at the critical startup window.
+- **Above the limit**: the excess is compressed (`excess_gain`, default
+  0.75) and capped (`excess_max_a`, default 1.2A — kept close to, not
+  below, the confirmed reaction margin) instead of climbing further.
+- **R1 hard floor**: with the contactor closed, every phase carries at
+  least the vehicle's own measured current (from vitals) — applied to the
+  *input* signal, not patched onto the output afterward (per the reference
+  project). A lower reading is physically impossible and would latch a
+  distrust state.
+- **Anti-glitch firewall** (asymmetric, per the reference project): a rise
+  in real current (or a gentle drop) is trusted immediately; a **sudden**
+  drop (`glitch_drop_a`, default 3A) is held at the last trusted value
+  until 2 consecutive samples agree on a new value (within
+  `glitch_confirm_tol_a`) — confirmed live, a single stale/desynced Shelly
+  sample dropped >4A in <10ms right during a fast multi-phase engagement
+  (physically impossible for a real ramp).
+- **Dither** (`dither_amplitude_a`, ±0.05A alternating at 1Hz, always on
+  including fail-safe) — `reported` is never perfectly static for long.
+- **Symmetric publication**: the final value is published identically on
+  all 3 Modbus registers — TWC3's own service loop expects
+  `min == mean == max` to correctly engage at the true constraint,
+  regardless of which phase is actually weakest.
+- **Escalation** (secondary safety net, 2-stage step per the reference
+  project, not a continuous ramp): if `o_raw` stays above the limit
+  continuously for `escalation_timeout_ms` (default 120s), force `reported`
+  to at least `law_nudge_min_a` past the limit; if it's *still* there after
+  `2×escalation_timeout_ms`, force it to `escalation_kick_a` (default
+  1.5A) — safely past the confirmed reaction margin.
+
+Both breakers (`twc_breaker_limit_a` and `main_breaker_limit_a`) still
+clamp `desired_avail` before any of the above — main-breaker protection is
+applied **after** slewing, so it's never delayed, regardless of mode.
+
+**GRID mode**: `desired_avail = twc_breaker_limit_a` (max allowed, subject
+to the same breaker clamps).
+
+**FVE mode**: `desired_avail` is the self-balancing target — averaged
+across the household-only signal on all 3 phases (aggregate/net billing,
+`switch.*_aggregate_balance_metering`) or the weakest phase (per-phase
+billing, default), plus the manual `fve_offset_kw`
+(`number.*_fve_offset`, runtime-adjustable in HA).
 
 Fail-safe: if any of the 6 HA-mirrored current/power entities has been
 reporting `unavailable`/`unknown` continuously for
@@ -73,29 +149,38 @@ stops sending updates without dropping the API connection.
 
 ### GRID mode
 
-`avail_mode` is simply `twc_breaker_limit_a` on all 3 phases — the car gets
-the max current either breaker allows, ignoring the direction of household
-flow.
+`desired_avail = twc_breaker_limit_a` (the max either breaker allows),
+subject to the same publication law and breaker clamps described above.
 
 ### FVE mode — per-phase (default, aggregate metering OFF)
 
-`avail_mode` reacts only to that phase's own export/import
-(`shelly_x_power` sign): exporting → `floor(real_x)` (rounded **down** to a
-whole amp, so surplus is never overshot into an actual import); importing →
-`-real_x` (precise, no rounding — back off exactly as much as needed).
+`desired_avail` tracks the **weakest phase's household-only** signal
+(`shelly_x_power` sign, car's own draw subtracted out via the TWC vitals
+API): exporting → back off less / take more; importing → back off.
 
 ### FVE mode — aggregate/net balance metering (optional, per-switch)
 
 Some utilities net import/export **across all 3 phases together** for
 billing, instead of settling each phase separately. In that case, blocking
 or under-using charging just because one phase individually imports (while
-others export a lot more) is overly conservative — the `switch.*_aggregate_balance_metering`
-entity (default OFF) fixes that.
+others export a lot more) is overly conservative — the
+`switch.*_aggregate_balance_metering` entity (default OFF) switches
+`desired_avail` from the weakest phase to the **average** of the
+household-only signal across all 3 phases instead.
 
-**Design history / why the final algorithm looks the way it does** — TWC3
-runs a live correlation check: it compares its own actual ramping current
-against the reported value, and stops charging within seconds if they don't
-track together (confirmed by direct testing, several iterations):
+Either way, the per-phase main-breaker safety check
+(`main_breaker_limit_a - real`) still applies unconditionally, after
+slewing, so it's never delayed.
+
+**Design history — earlier algorithm generations, kept for context.** The
+generations below all predate the discovery that TWC3 FW 26.26.1 doesn't
+proportionally track `reported` below its own breaker limit at all — they
+were solving a real problem (TWC3's live *correlation* check, which is
+still real and still relevant) with a fine-grained "compute exact available
+current" model that turned out not to matter for actual control on this
+firmware. Kept here because the correlation-safety lessons (1:1 slope
+tracking, no dilution, no smoothing/EMA) still apply directly to the
+current design's `worst` term:
 
 1. First attempt: report the **same phase-averaged** value on all 3
    registers. Broke correlation — while a phase ramps up alone (TWC3 engages
@@ -103,87 +188,31 @@ track together (confirmed by direct testing, several iterations):
    phase's own signal to ~1/3 of its real slope. TWC3 saw the mismatch and
    stopped charging within seconds of starting.
 2. Second attempt: keep each phase's own real current as the base (fixes
-   correlation), rescue an importing phase only up to breakeven (`avail = 0`)
-   using surplus borrowed from exporting phases. Correlation-safe, but since
-   TWC3 applies `min(avail_a, avail_b, avail_c)` as the actual charging
-   current, a single weak/importing phase capped at breakeven still
-   bottlenecked the whole session to ~0A even with a large net export.
+   correlation), rescue an importing phase only up to breakeven using
+   surplus borrowed from exporting phases. Correlation-safe, but since TWC3
+   applies `min(avail_a, avail_b, avail_c)`-equivalent logic, a single
+   weak/importing phase capped at breakeven still bottlenecked the whole
+   session to ~0A even with a large net export.
 3. Third attempt: **water-filling** — raise the weakest phase(s) all the way
-   toward the strongest, to maximize the minimum. This turned out to be an
-   actual bug, not just an over-optimization: since TWC3 applies
-   `I = min(avail_a, avail_b, avail_c)` as the *same* current on all 3
-   phases, total car power is `3*I`. Leaving every phase's own value
-   untouched while *also* spending the whole surplus pool again to raise the
-   minimum double-counted it — e.g. a real 23A/~5.3kW pool got water-filled
-   to `min(avail) = 15.33A`, implying `3*15.33 ≈ 46A`/~10.6kW of charging
-   power from surplus that didn't exist.
-4. Fourth: **`avail_mode_x = max(strict_x, pool/3)`**. For the whole house to
-   stay net-export/zero in aggregate, `3*I <= pool` must hold, i.e.
-   `I <= pool/3` — that's the exact, no-more-no-less ceiling. A phase
-   already above `pool/3` is left untouched (1:1 correlation, no dilution);
-   a phase below it is raised exactly up to `pool/3` (never higher). The
-   resulting `min(avail)` lands exactly on `pool/3`, so the real surplus is
-   used in full with no double-counting and no correlation loss for
-   whichever phase doesn't need help.
+   toward the strongest. Turned out to be an actual double-counting bug
+   (spending the same surplus pool twice), not just an over-optimization.
+4. Fourth: `avail_mode_x = max(strict_x, pool/3)` — a correlation-safe,
+   no-double-counting ceiling. Solved the availability-math problem
+   correctly, but was superseded once the threshold-ignoring firmware
+   behavior was confirmed and made the whole availability-math approach
+   moot (see "Publication law" above).
+5. A gain-damped self-balancing loop (`self_balance_gain`) and an EMA/
+   low-pass smoothing attempt were both tried and reverted for this same
+   underlying reason — see "Publication law" above for the design that
+   replaced them (household-only signal + slew-rate limiter, eliminating
+   the feedback loop and the correlation-vs-lag trade-off at the source
+   instead of damping it).
 
-The per-phase main-breaker safety check (`main_breaker_limit_a - real`)
-still applies underneath all 3 variants, unconditionally.
-
-**Self-balancing loop gain (`self_balance_gain`)** — the formula above still
-feeds the car's own current straight back into its own availability
-calculation with full 1:1 weight, which is a textbook marginally-stable
-discrete feedback loop (multiplier -1): with a constant household load and
-constant PV output, this produces a *sustained bang-bang oscillation*
-instead of converging (confirmed live — reported cycling ~13-16A while TWC3
-hunted between ~8-12A, indefinitely).
-
-- A temporal fix (EMA/low-pass smoothing of `reported`) was tried and
-  reverted: any such filter necessarily lags the reported value behind
-  TWC3's actual current, and TWC3's live correlation check distrusts that
-  mismatch and stops charging (confirmed live — charging stopped/restarted
-  exactly when a smoothed value was still catching up to an already-changed
-  real current).
-- Fix instead: a plain multiplicative gain `k` (`self_balance_gain`,
-  currently `0.75`), recomputed fresh every cycle from the *current* real
-  reading only — no history, no lag, so it still moves in lockstep with
-  TWC3's own current changes (same cycle), just with reduced slope.
-  Iterating `I_(n+1) = k*E - k*I_n` has multiplier `-k` instead of `-1`,
-  which converges for `k < 1`.
-- Trade-off: the equilibrium settles at a fraction of the theoretical max
-  surplus usage, not the full amount — confirmed live, several hundred W
-  to ~2kW of real surplus can go unused at steady state depending on `k`.
-  This is the price of stability without a full PID controller. The
-  unused fraction is `E/(1+k)` — even *zero* damping (`k=1`) already
-  leaves `E/2` unused, since the car's own current is fed back into its
-  own availability calculation; gain reduction only makes that worse. `k`
-  is a direct trade: lower = smaller residual oscillation, less usable
-  surplus; higher = more surplus used, larger (but still bounded,
-  self-recovering) oscillation. `0.65` and `0.75` were both confirmed
-  stable live (no stopping) over multi-minute sessions including real
-  load transients — `0.75` chosen for noticeably less wasted surplus
-  (~1.5kW unused vs. `0.65`'s ~1.3-2kW) at the cost of a visibly larger
-  residual wobble during steady-state draw.
-- Gain has a floor: TWC3's own minimum charge current is 5A, and too low a
-  `k` shrinks the aggregate `pool/3` target (which absorbs the same gain as
-  every `strict_x` feeding into it) below that floor — confirmed live,
-  `k=0.5` produced a target of 3.5A in a real scenario that would've
-  gotten 7A ungained, and charging never started at all.
-
-**Escalation (`escalation_timeout_ms`, all modes):** TWC3 was observed to
-ramp down very slowly toward a sustained `reported == twc_breaker_limit_a`
-(0A available) on all 3 phases, and could keep drawing a small residual
-current indefinitely despite continued import instead of stopping outright.
-If all 3 phases stay pinned at the full breaker limit for
-`escalation_timeout_ms` straight, `reported` is nudged 0.1A past the limit
-(`twc_breaker_limit_a + 0.1`) to force a hard stop.
-
-Confirmed live: the gain-damped self-balancing loop still briefly touches
-the `reported == twc_breaker_limit_a` ceiling during a session's *startup*
-transient (before it settles) — the original 30s threshold was short enough
-for that transient alone to trigger this escalation, forcing a hard stop
-right after every session start, which then restarted, repeating
-indefinitely. Raised to 120s, which gives the loop enough time to settle
-past the startup transient before escalation can trigger.
+**Escalation (`escalation_timeout_ms`)** was originally a continuous ramp
+(`+0.1A` every 5s while `reported` sat at the limit) — useful as a
+diagnostic tool to map TWC3's exact reaction threshold live, but replaced
+with the current 2-stage step (see "Publication law" above) to match the
+independently-validated reference design once the threshold was confirmed.
 
 ### Disabling external control (`switch.*_twc_control_enabled`)
 
@@ -218,6 +247,10 @@ TWC3's stock behavior without touching the RS485 wiring or reflashing.
      positive = import)
    - `ha_charge_from_grid_entity` — the `input_boolean` helper you create in
      step 4 below (defaults to `input_boolean.charge_from_grid`)
+   - `twc_vitals_ip` — TWC3's own LAN IP address (find it in your router's
+     DHCP client list — TWC3 exposes an unauthenticated local
+     `/api/1/vitals` JSON endpoint used for the R1 hard floor, the
+     household-only self-balancing signal, and diagnostic sensors)
 2. The Shelly CT clamps must be on the **main incomer** (measuring the TWC
    branch too) — otherwise the formula in `recompute_ct` doesn't hold.
 3. In Home Assistant, confirm the 6 entities from step 1 exist and update
@@ -260,33 +293,40 @@ python3 -m venv venv
   data available (HA-reported, debounced — see Fail-safe above).
 - `binary_sensor.*_twc_ha_link_ok` — is the HA API connection active.
 - `binary_sensor.*_charge_from_grid` — currently mirrored mode from HA.
+- `sensor.*_twc_vitals_current_l1/l2/l3`, `*_twc_vitals_vehicle_current` —
+  the car's own per-phase/total current, straight from TWC3's local vitals
+  API (diagnostic; also feeds the R1 floor and the household-only signal).
+- `binary_sensor.*_twc_vitals_contactor_closed` — TWC3's own reported
+  contactor state, from vitals.
 - `switch.*_aggregate_balance_metering` — **default OFF**, FVE-mode-only, see
   "aggregate/net balance metering" above.
 - `switch.*_twc_control_enabled` — **default ON**, see "Disabling external
   control" above.
+- `number.*_fve_offset` — manual kW offset added to the FVE-mode
+  self-balancing target, runtime-adjustable in HA (`-5.0`..`+5.0`).
 
 ## Known limitations / behavior
 
 - **Home Assistant is a hard dependency for power control**, not just
   start/stop — if the HA API connection or the 6 mirrored real-current/power
-  entities go stale, the firmware fails safe (0A available) rather than
-  continuing to charge on old data. This trades away the earlier
-  direct-HTTP-poll design's partial independence from HA in exchange for
-  avoiding Shelly Gen2's brute-force login protection entirely (no local
-  auth to manage at all).
-- TWC3 applies **a single shared current to all phases** (not per-phase) and
-  engages them sequentially (L1 → L2 → L3) when ramping up — this is exactly
-  why the aggregate-metering algorithm had to be redesigned around
-  correlation-safe, additive-only credit capped at `pool/3` (see above)
-  instead of a naive phase average or an uncapped water-fill.
-- FVE mode (both per-phase and aggregate) is a bang-bang controller (not
-  PID) — near `signed≈0` (exactly balanced) it may pulse slightly around
-  zero grid exchange.
-- `self_balance_gain < 1` (see "Self-balancing loop gain" above) trades
-  full surplus utilization for stability: confirmed live, a few hundred W
-  of real export goes unused at steady state, and a real load transient
-  (e.g. an appliance switching on) can still cause brief, self-recovering
-  oscillation before the loop re-settles.
+  entities go stale, the firmware fails safe (`reported = twc_breaker_limit_a`,
+  0A available) rather than continuing to charge on old data. This trades
+  away the earlier direct-HTTP-poll design's partial independence from HA
+  in exchange for avoiding Shelly Gen2's brute-force login protection
+  entirely (no local auth to manage at all). TWC3's own vitals API is
+  polled directly (no HA dependency) but is used only as a diagnostic/
+  supporting signal, not as a substitute data source for fail-safe purposes.
+- TWC3 FW 26.26.1 does **not** proportionally track `reported` below its own
+  configured breaker limit — confirmed live, repeatedly — it only reacts
+  once `reported` crosses the limit by ~1.1-1.2A. This is a firmware
+  behavior, not something this project can compute around; the whole
+  publication-law design (see "How it works" above) exists to work with it
+  rather than against it.
+- FVE mode is a bang-bang-flavored controller (not PID) — near `signed≈0`
+  (exactly balanced) it may pulse slightly around zero grid exchange, and
+  the household-only self-balancing target is slew-rate-limited
+  (`desired_avail_slew_a_per_s`), so it deliberately does not react
+  instantly to a sudden load/export change.
 - The register map (identification block, Neurio meter MAC/model/serial
   number) is a fixed placeholder taken from the reverse-engineered project
   linked below — it's not real data from any physical device.
@@ -297,6 +337,12 @@ python3 -m venv venv
 - https://github.com/Klangen82/tesla-wall-connector-control (MIT License)
 - https://community.home-assistant.io/t/tesla-wall-connector-gen-3-via-esphome-rs485-dynamic-current-control-no-wifi/985613
 - https://shelly-api-docs.shelly.cloud/gen2/ComponentsAndServices/EM (EM.GetStatus RPC)
+- https://github.com/zany92/tesla-loadpilot — independently-developed,
+  live-validated solution to the same TWC3 threshold-ignoring behavior;
+  the current publication law, anti-glitch firewall, R1 floor, and 2-stage
+  escalation are adapted from its actual source
+  (`esphome/packages/twc-core.yaml`), cross-checked directly rather than
+  from its docs (see "Publication law" above for why)
 
 ## License
 
