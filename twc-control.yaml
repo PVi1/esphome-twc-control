@@ -136,18 +136,26 @@ substitutions:
   # this long after the LAST time a correction was needed, before
   # resuming the normal slow release underneath it.
   post_correction_hold_ms: "60000"   # 1 minute
-  # min_charge_current_a / low_surplus_grace_ms: requested explicitly, to
-  # cut down on contactor cycling (mechanical wear) from brief transient
-  # surplus dips (a passing cloud). See the grace_active block in
-  # recompute_ct for the full rationale and two earlier attempts that
+  # min_charge_current_a / grace_vitals_threshold_a: requested explicitly,
+  # to cut down on contactor cycling (mechanical wear) from brief
+  # transient surplus dips (a passing cloud). See the grace_active block
+  # in recompute_ct for the full rationale and two earlier attempts that
   # didn't work. The natural o_raw/pub signal is never modified by this
-  # (real regulation/grid-avoidance stays fully intact) -- min_charge_current_a
-  # is only used to CONFIRM via vitals that TWC3 has already throttled
-  # the car down near its own minimum in response to that natural signal,
-  # which is the only condition under which our own forced escalation
-  # gets suppressed, for up to low_surplus_grace_ms.
+  # (real regulation/grid-avoidance stays fully intact) -- these are only
+  # used to CONFIRM via vitals that TWC3 has already throttled the car
+  # down near its own minimum in response to that natural signal, which
+  # is the only condition under which our own forced escalation gets
+  # suppressed (for up to number.*_low_surplus_grace_period, HA-adjustable
+  # -- see the number: section below).
+  #
+  # min_charge_current_a (5A) is TWC3's own documented minimum charge
+  # current, kept as a reference value. grace_vitals_threshold_a is the
+  # actual detection threshold used against vitals_vehicle_current --
+  # confirmed live, the car's real observed minimum under load can sit
+  # a bit above the nominal 5A (observed ~6A), so the detection margin
+  # is set higher than min_charge_current_a itself to actually catch it.
   min_charge_current_a: "5.0"
-  low_surplus_grace_ms: "120000"   # 2 minutes
+  grace_vitals_threshold_a: "7.0"
   # dither: small always-on alternation so "reported" is never perfectly
   # static for long, even at rest/fail-safe -- a genuinely static value
   # was independently identified (both by us and by the reference
@@ -353,7 +361,7 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  # --- low-surplus grace period state (see low_surplus_grace_ms above) ---
+  # --- low-surplus grace period state (see number.*_low_surplus_grace_period above) ---
   - id: low_surplus_since_ms
     type: uint32_t
     restore_value: no
@@ -756,7 +764,8 @@ script:
             float bias_offset = twc_breaker - desired_avail;
             float o_raw = worst + bias_offset;
 
-            // Low-surplus grace period (see low_surplus_grace_ms above):
+            // Low-surplus grace period (see min_charge_current_a /
+            // grace_vitals_threshold_a above and number.*_low_surplus_grace_period):
             // requested explicitly, to cut down on contactor cycling
             // (mechanical wear) from brief transient surplus dips (a
             // passing cloud).
@@ -783,20 +792,25 @@ script:
             // ESCALATION step below (which would otherwise force
             // reported even further above the limit): once vitals
             // confirms the car has actually throttled down near its own
-            // minimum (not assumed -- observed), hold off on forcing it
-            // any further for up to low_surplus_grace_ms, giving the car
-            // a chance to keep trickling at minimum while conditions
+            // minimum (not assumed -- observed against
+            // grace_vitals_threshold_a, not min_charge_current_a itself --
+            // see above for why), hold off on forcing it any further for
+            // up to number.*_low_surplus_grace_period (HA-adjustable at
+            // runtime -- the right duration depends on how long a
+            // passing cloud actually takes to clear), giving the car a
+            // chance to keep trickling at a reduced rate while conditions
             // hopefully improve, instead of deliberately forcing a full
             // stop. If the car ISN'T near its minimum (still drawing
             // significantly more), grace never engages at all -- the
             // natural signal and escalation proceed exactly as before.
             bool car_near_min = car_charging &&
-                (id(twc_vitals_vehicle_current) <= (float)${min_charge_current_a} + 0.5f);
+                (id(twc_vitals_vehicle_current) <= (float)${grace_vitals_threshold_a});
             bool grace_active = false;
             if (!grid_mode && o_raw > twc_breaker && car_near_min) {
               if (id(low_surplus_since_ms) == 0) id(low_surplus_since_ms) = now_ms;
               uint32_t over_for = now_ms - id(low_surplus_since_ms);
-              if (over_for < (uint32_t)${low_surplus_grace_ms}) {
+              uint32_t grace_ms = (uint32_t)(id(low_surplus_grace_s).state * 1000.0f);
+              if (over_for < grace_ms) {
                 grace_active = true;
               }
             } else if (o_raw <= twc_breaker) {
@@ -924,7 +938,7 @@ script:
             // already confirmed near its own minimum in response to the
             // natural (unmodified) signal -- forcing it even further
             // would only risk a full abort we're deliberately trying to
-            // avoid for up to low_surplus_grace_ms.
+            // avoid for up to number.*_low_surplus_grace_period.
             if (o_raw > twc_breaker) {
               // capped_since_ms tracks how long o_raw has been over the
               // limit CONTINUOUSLY, regardless of grace -- only the
@@ -1039,6 +1053,24 @@ number:
     initial_value: 0.0
     on_value:
       - script.execute: recompute_ct
+
+  # Low-surplus grace period duration (see the grace_active block in
+  # recompute_ct) -- requested explicitly to be HA-adjustable at runtime
+  # rather than a fixed compile-time constant, since the right duration
+  # depends on how long a passing cloud actually takes to clear (observed
+  # live: as short as ~12s), not a fixed value that fits every situation.
+  - platform: template
+    id: low_surplus_grace_s
+    name: "Low Surplus Grace Period"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 300.0
+    step: 1.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 12.0
 
 # ---------------------------------------------------------------------------
 # Safety-net recompute: recompute_ct is otherwise ONLY triggered by one of
