@@ -97,6 +97,20 @@ substitutions:
   # while still tracking real, sustained solar/household changes over
   # seconds just fine.
   desired_avail_slew_a_per_s: "1.0"
+  # release_slew_a_per_s: max rate DECREASES to the final published value
+  # are allowed below twc_breaker_limit_a (increases stay instant -- an
+  # instant RISE in "reported" is protective, same philosophy as the
+  # anti-glitch firewall; only easing capacity back to the car needs
+  # caution). Confirmed live: worst (a phase's own raw real current, not
+  # slew-limited -- it must track 1:1 for TWC3's correlation check) can
+  # drop abruptly (e.g. the moment a session/phase disengages), yanking
+  # pub down in a single step even though desired_avail itself is already
+  # slew-limited. Requested explicitly: release budget cautiously --
+  # snap down to exactly twc_breaker_limit_a first (one step, not
+  # further), then ease down from there no faster than
+  # release_slew_a_per_s, giving TWC3 time to visibly react (watch its
+  # own vitals current) between each step instead of a big single jump.
+  release_slew_a_per_s: "0.1"   # 0.5A per 5s
   # dither: small always-on alternation so "reported" is never perfectly
   # static for long, even at rest/fail-safe -- a genuinely static value
   # was independently identified (both by us and by the reference
@@ -298,6 +312,16 @@ globals:
     restore_value: no
     initial_value: "0.0"
   - id: desired_avail_last_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # --- pub release-rate limiter state (see release_slew_a_per_s above) ---
+  - id: pub_release_prev
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: pub_release_last_update_ms
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -685,6 +709,32 @@ script:
               float excess = std::min(((float)${excess_gain}) * (o_raw - twc_breaker), (float)${excess_max_a});
               excess = std::max(excess, (float)${law_nudge_min_a});
               pub = twc_breaker + excess;
+            }
+
+            // Release-rate limiter (see release_slew_a_per_s above):
+            // RISES stay instant (protective); a DECREASE first snaps to
+            // exactly twc_breaker (one step, from anywhere above it),
+            // then eases down no faster than release_slew_a_per_s.
+            if (std::isnan(id(pub_release_prev))) {
+              id(pub_release_prev) = pub;
+              id(pub_release_last_update_ms) = now_ms;
+            } else if (pub >= id(pub_release_prev)) {
+              id(pub_release_prev) = pub;
+              id(pub_release_last_update_ms) = now_ms;
+            } else {
+              float elapsed_s = (now_ms - id(pub_release_last_update_ms)) / 1000.0f;
+              float floor_val;
+              if (id(pub_release_prev) > twc_breaker) {
+                // First step down from the excess zone: snap straight to
+                // the limit, never below, regardless of elapsed time.
+                floor_val = twc_breaker;
+              } else {
+                float max_delta = (float)${release_slew_a_per_s} * std::max(elapsed_s, 0.001f);
+                floor_val = id(pub_release_prev) - max_delta;
+              }
+              pub = std::max(pub, floor_val);
+              id(pub_release_prev) = pub;
+              id(pub_release_last_update_ms) = now_ms;
             }
 
             pub += dither;
