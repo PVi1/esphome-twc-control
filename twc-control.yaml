@@ -662,21 +662,34 @@ script:
 
             reported_a = reported_b = reported_c = pub;
 
-            // DIAGNOSTIC: single-line summary of every decisive value
-            // each recompute cycle, for live monitoring via
-            // `esphome logs` instead of only reconstructing after the
-            // fact from HA history graphs.
+            // DIAGNOSTIC: single-line CSV summary of every decisive value
+            // each recompute cycle, for live monitoring via `esphome logs`
+            // and machine parsing (grep tag "csv", strip the ESPHome
+            // [time][level][tag:line]: prefix, feed the rest to a CSV
+            // reader). The header row (field names) is logged once at
+            // boot under tag "csv_header", and re-emitted every 5 minutes
+            // so a log session started mid-run still sees it once.
             {
               const char *mode_str = grid_mode ? "GRID" :
                   (id(aggregate_balance_metering).state ? "AGG" : "PERPHASE");
-              ESP_LOGI("shelly",
-                  "[%s] real=%.2f/%.2f/%.2f signed=%.2f/%.2f/%.2f household=%.2f/%.2f/%.2f desired_avail=%.2f worst=%.2f o_raw=%.2f pub=%.2f offset=%.2fkW vitals=%.2f/%.2f/%.2f(veh=%.2f,%s)",
-                  mode_str, real_a, real_b, real_c,
+              static uint32_t last_header_ms = 0;
+              static bool header_sent_once = false;
+              if (!header_sent_once || now_ms - last_header_ms >= 300000) {
+                header_sent_once = true;
+                last_header_ms = now_ms;
+                ESP_LOGI("csv_header",
+                    "ts_ms,mode,real_a,real_b,real_c,signed_a,signed_b,signed_c,"
+                    "household_a,household_b,household_c,desired_avail,worst,o_raw,pub,"
+                    "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed");
+              }
+              ESP_LOGI("csv",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d",
+                  now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
                   household_a, household_b, household_c,
                   desired_avail, worst, o_raw, pub, fve_offset_kw,
                   id(twc_vitals_current_a), id(twc_vitals_current_b), id(twc_vitals_current_c),
-                  id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? "closed" : "open");
+                  id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? 1 : 0);
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
