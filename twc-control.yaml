@@ -380,6 +380,10 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  - id: hold_bias_offset
+    type: float
+    restore_value: no
+    initial_value: "0.0"
 
   # --- TWC3's own vitals (diagnostic only, see twc_vitals_ip above) ---
   - id: twc_vitals_current_a
@@ -858,11 +862,23 @@ script:
             // immediately ramped back up seeing room again, re-crossing
             // the limit within seconds (~1-2s repeating cycle). Refreshed
             // every cycle a correction is actually needed (o_raw >
-            // twc_breaker); while within the hold window, pub stays
-            // pinned at exactly twc_breaker instead of continuing to
-            // ease below it.
+            // twc_breaker); while within the hold window, pub is floored
+            // relative to worst using the bias captured at the LAST
+            // correction (hold_bias_offset), not a flat twc_breaker
+            // constant.
+            //
+            // Confirmed live (bug, now fixed): pinning pub at a flat,
+            // unmoving twc_breaker for the whole hold window broke
+            // TWC3's own correlation check -- its ammeter was observed
+            // ramping the car's real current 8->10A while our published
+            // value sat perfectly static, which is physically implausible
+            // for a real combined-circuit meter (the car's own draw is
+            // part of that circuit) and risks the exact distrust/abort
+            // reaction the dither mechanism exists to avoid. Session
+            // aborted with a real 4.7kW surplus still available.
             if (o_raw > twc_breaker) {
               id(post_correction_hold_until_ms) = now_ms + (uint32_t)${post_correction_hold_ms};
+              id(hold_bias_offset) = bias_offset;
             }
 
             if (now_ms < 15000 || std::isnan(id(pub_release_prev))) {
@@ -874,10 +890,15 @@ script:
             } else {
               float elapsed_s = (now_ms - id(pub_release_last_update_ms)) / 1000.0f;
               float floor_val;
-              if (id(pub_release_prev) > twc_breaker || now_ms < id(post_correction_hold_until_ms)) {
-                // First step down from the excess zone, OR still within
-                // the post-correction hold window: pin at the limit,
-                // never below, regardless of elapsed time.
+              if (now_ms < id(post_correction_hold_until_ms)) {
+                // Still within the post-correction hold window: track
+                // worst 1:1 (correlation-safe) using the bias frozen at
+                // the last correction, floored at twc_breaker so it
+                // never drops low enough to invite a premature re-ramp.
+                floor_val = std::max(twc_breaker, worst + id(hold_bias_offset));
+              } else if (id(pub_release_prev) > twc_breaker) {
+                // First step down from the excess zone (hold already
+                // expired): snap straight to the limit, never below.
                 floor_val = twc_breaker;
               } else {
                 float max_delta = (float)${release_slew_a_per_s} * std::max(elapsed_s, 0.001f);
