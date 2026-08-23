@@ -672,7 +672,15 @@ script:
 
             float pub;
             if (o_raw <= twc_breaker) {
-              pub = o_raw;
+              // Floor at 0: during strong export, worst (a phase's own
+              // real current, negative while exporting) plus bias_offset
+              // can go negative -- confirmed live (~5975W export -> pub
+              // ~-0.1A). A real meter/EVSE current reading is never
+              // negative, and reported=0 already signals maximum
+              // availability (breaker - 0 = full breaker); anything more
+              // negative adds no information, only untested territory for
+              // TWC3's own correlation check.
+              pub = std::max(o_raw, 0.0f);
             } else {
               float excess = std::min(((float)${excess_gain}) * (o_raw - twc_breaker), (float)${excess_max_a});
               excess = std::max(excess, (float)${law_nudge_min_a});
