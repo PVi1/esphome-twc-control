@@ -740,7 +740,22 @@ script:
             // SYMMETRICALLY on all 3 registers.
             float worst = std::max(std::max(corr_a, corr_b), corr_c);
             float bias_offset = twc_breaker - desired_avail;
-            float o_raw = worst + bias_offset;
+            // worst is only added while the car is actually drawing
+            // current (car_charging) -- that's when reported MUST track
+            // 1:1 with TWC3's own ramping current for its live
+            // correlation check, or it distrusts the meter. While idle
+            // (car_charging=false, nothing to correlate against yet),
+            // adding worst just double-counts the household's own
+            // baseline (household_x already subtracts it out of
+            // desired_avail) and produces an unnecessarily low starting
+            // value -- confirmed live, ~4A reported at a genuine 8A/phase
+            // export the household-only budget (desired_avail) already
+            // supported, and a real Tesla session visibly starting slow
+            // (1A/16A target -> ramping to 7A/7A) as a result. Idle,
+            // reported is simply bias_offset (breaker - desired_avail)
+            // directly -- exactly the weakest-exporting-phase (per-phase
+            // mode) or aggregate balance (AGG mode) budget itself.
+            float o_raw = car_charging ? (worst + bias_offset) : bias_offset;
 
             // Low-surplus grace period (see min_charge_current_a /
             // grace_vitals_threshold_a above and number.*_low_surplus_grace_period):
@@ -851,7 +866,12 @@ script:
               id(hold_bias_offset) = bias_offset;
             }
             if (now_ms < id(post_correction_hold_until_ms)) {
-              float floor_val = std::max(twc_breaker, worst + id(hold_bias_offset));
+              // Same car_charging gating as o_raw above -- worst only
+              // gets added while there's an actual car ramp to correlate
+              // with; otherwise it double-counts the household baseline
+              // the same way it would in the main o_raw computation.
+              float floor_val = std::max(twc_breaker,
+                  (car_charging ? worst : 0.0f) + id(hold_bias_offset));
               pub = std::max(pub, floor_val);
             }
 
