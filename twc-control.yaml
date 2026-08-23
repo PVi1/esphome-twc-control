@@ -76,8 +76,20 @@ substitutions:
   # the point TWC3 reacts to without needlessly overshooting further.
   excess_max_a: "1.2"
   # law_nudge_min_a: floor on the compressed excess whenever above the
-  # limit at all -- matches the reference project's own minimum nudge.
-  law_nudge_min_a: "0.1"
+  # limit at all. Confirmed live: TWC3's threshold reaction has TWO
+  # distinct bands, not one -- reported in (twc_breaker, twc_breaker+~1.1)
+  # only makes TWC3 STOP INCREASING the car's current (a "hold", observed
+  # sitting flat for minutes at a fixed current); it takes crossing
+  # ~1.1A past the limit before TWC3 actually DECREASES it. A small
+  # graduated nudge (originally 0.1A, matching the reference project's
+  # own minimum) spends real time sitting ineffectively in that "hold"
+  # band whenever a genuine deficit needs correcting -- confirmed live,
+  # reported=20.9 (twc_breaker=20) left the car flat at its current
+  # draw with a real, uncorrected ~330W/1.2A grid import persisting.
+  # Raised to jump straight to the confirmed-effective band the moment
+  # any correction is actually needed, instead of lingering in the
+  # hold band first.
+  law_nudge_min_a: "1.1"
   # desired_avail_slew_a_per_s: max rate of change allowed for
   # desired_avail (our "budget"/target-setting term) per second. In the
   # reference project, "budget" is a fixed/slow-changing external quantity
@@ -985,8 +997,8 @@ number:
     name: "FVE Offset"
     icon: "mdi:tune-variant"
     unit_of_measurement: "kW"
-    min_value: -5.0
-    max_value: 5.0
+    min_value: -10.0
+    max_value: 10.0
     step: 0.1
     mode: box
     optimistic: true
