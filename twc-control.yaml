@@ -111,6 +111,19 @@ substitutions:
   # release_slew_a_per_s, giving TWC3 time to visibly react (watch its
   # own vitals current) between each step instead of a big single jump.
   release_slew_a_per_s: "0.1"   # 0.5A per 5s
+  # min_charge_current_a / low_surplus_grace_ms: requested explicitly, to
+  # cut down on contactor cycling (mechanical wear) from brief transient
+  # surplus dips (a passing cloud): when the true household-derived
+  # desired_avail wants to drop below TWC3's own minimum charge current
+  # (5A), don't let it -- hold desired_avail floored at 5A ("tolerated
+  # minimum", the car keeps charging at its lowest rate) for up to
+  # low_surplus_grace_ms. Only if the deficit is STILL there once the
+  # grace period expires do we let desired_avail fall through to its true
+  # (possibly negative) value, which then correctly escalates reported
+  # past the limit and lets TWC3 stop the session -- the deliberate,
+  # final fallback, not the first response to every brief dip.
+  min_charge_current_a: "5.0"
+  low_surplus_grace_ms: "120000"   # 2 minutes
   # dither: small always-on alternation so "reported" is never perfectly
   # static for long, even at rest/fail-safe -- a genuinely static value
   # was independently identified (both by us and by the reference
@@ -310,8 +323,14 @@ globals:
   - id: desired_avail_prev
     type: float
     restore_value: no
-    initial_value: "0.0"
+    initial_value: "NAN"
   - id: desired_avail_last_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # --- low-surplus grace period state (see low_surplus_grace_ms above) ---
+  - id: low_surplus_since_ms
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -661,11 +680,50 @@ script:
             }
             desired_avail = std::min(desired_avail, twc_breaker);
 
+            // Low-surplus grace period (see min_charge_current_a /
+            // low_surplus_grace_ms above) -- FVE modes only, GRID mode
+            // never needs it (desired_avail is already pinned at
+            // twc_breaker there). A brief dip (e.g. a passing cloud)
+            // shouldn't escalate reported past the limit and cost the
+            // contactor a cycle -- tolerate holding the car at its own
+            // minimum for a while first.
+            bool grace_active = false;
+            if (!grid_mode) {
+              bool low_surplus = desired_avail < (float)${min_charge_current_a};
+              if (low_surplus) {
+                if (id(low_surplus_since_ms) == 0) id(low_surplus_since_ms) = now_ms;
+                uint32_t low_for = now_ms - id(low_surplus_since_ms);
+                if (low_for < (uint32_t)${low_surplus_grace_ms}) {
+                  grace_active = true;
+                  desired_avail = (float)${min_charge_current_a};
+                }
+                // else: grace expired, let the true (possibly negative)
+                // desired_avail fall through -- deliberate final fallback.
+              } else {
+                id(low_surplus_since_ms) = 0;
+              }
+            }
+
             // Slew-rate limit desired_avail (see desired_avail_slew_a_per_s
             // above) BEFORE the main-breaker clamp -- that clamp is a hard
             // safety limit and must react instantly/unslowed; only the
             // soft, solar/household-derived target gets smoothed.
-            {
+            //
+            // Confirmed live (bug, now fixed): starting desired_avail_prev
+            // at a fixed 0.0 on boot made desired_avail spend its first
+            // several seconds ramping UP from 0 toward the true target,
+            // during which the artificially-low desired_avail legitimately
+            // computed a HIGH bias_offset -- pushing pub into the excess
+            // zone as a pure boot artifact, which the release-rate limiter
+            // then latched onto as if a real excess event had happened,
+            // holding reported artificially high for up to ~2 minutes
+            // after every boot/reflash. Fixed the same way pub_release_prev
+            // already is: pass the raw value through unlimited on the very
+            // first call after boot.
+            if (std::isnan(id(desired_avail_prev))) {
+              id(desired_avail_prev) = desired_avail;
+              id(desired_avail_last_update_ms) = now_ms;
+            } else {
               const float slew_a_per_s = ${desired_avail_slew_a_per_s};
               float elapsed_s = (now_ms - id(desired_avail_last_update_ms)) / 1000.0f;
               float max_delta = slew_a_per_s * std::max(elapsed_s, 0.001f);
@@ -715,7 +773,19 @@ script:
             // RISES stay instant (protective); a DECREASE first snaps to
             // exactly twc_breaker (one step, from anywhere above it),
             // then eases down no faster than release_slew_a_per_s.
-            if (std::isnan(id(pub_release_prev))) {
+            //
+            // Confirmed live (bug, now fixed): even with desired_avail's
+            // own boot-ramp fixed, some brief post-boot transient (exact
+            // source unconfirmed -- likely HA/vitals data still catching
+            // up before an "esphome logs" client could even connect to
+            // observe it) could still get latched as pub_release_prev's
+            // very first value, then held for up to ~2 minutes even
+            // though it was never a real excess event. Bypassed entirely
+            // for the first 15s after boot -- comfortably past every data
+            // source's own startup/reconnect window -- so the limiter
+            // only ever starts tracking from a value that's already
+            // reflecting real conditions.
+            if (now_ms < 15000 || std::isnan(id(pub_release_prev))) {
               id(pub_release_prev) = pub;
               id(pub_release_last_update_ms) = now_ms;
             } else if (pub >= id(pub_release_prev)) {
@@ -760,10 +830,10 @@ script:
                     "ts_ms,mode,real_a,real_b,real_c,signed_a,signed_b,signed_c,"
                     "corr_a,corr_b,corr_c,household_a,household_b,household_c,"
                     "desired_avail,worst,o_raw,pub,"
-                    "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging");
+                    "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging,grace_active");
               }
               ESP_LOGI("csv",
-                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d,%d",
                   now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
                   corr_a, corr_b, corr_c,
@@ -771,7 +841,7 @@ script:
                   desired_avail, worst, o_raw, pub, fve_offset_kw,
                   id(twc_vitals_current_a), id(twc_vitals_current_b), id(twc_vitals_current_c),
                   id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? 1 : 0,
-                  car_charging ? 1 : 0);
+                  car_charging ? 1 : 0, grace_active ? 1 : 0);
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
