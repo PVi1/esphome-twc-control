@@ -569,32 +569,6 @@ script:
             float signed_b = (id(shelly_b_power) < 0.0f) ? -floorf(real_b) : real_b;
             float signed_c = (id(shelly_c_power) < 0.0f) ? -floorf(real_c) : real_c;
 
-            // R1 hard floor, applied to the INPUT signal (per the
-            // reference project -- not patched onto the output
-            // afterward): with the car genuinely charging, every phase
-            // carries at least the vehicle's own measured current on that
-            // branch -- a lower reading is physically impossible and (per
-            // the reference project) latches TWC3's distrust state.
-            //
-            // Confirmed live (direct curl against /api/1/vitals): TWC3's
-            // own contactor_closed flag genuinely flickers true/false every
-            // ~2s while the car is plugged in but idle (a periodic
-            // self-test/precharge pulse, not real charging) -- with
-            // vehicle_current_a staying near 0.2-0.4A the whole time, far
-            // below TWC3's own 5A minimum charge current. Trusting
-            // contactor_closed alone made every one of those blips floor
-            // an exporting phase (e.g. signed=-7.00) up toward ~0, which
-            // then whipsawed desired_avail and the published value even
-            // with a completely static real household load. Gated instead
-            // on the car actually drawing meaningful current.
-            const bool car_charging = id(twc_vitals_contactor_closed) &&
-                (id(twc_vitals_vehicle_current) >= 2.0f);
-            if (car_charging) {
-              signed_a = std::max(signed_a, id(twc_vitals_current_a));
-              signed_b = std::max(signed_b, id(twc_vitals_current_b));
-              signed_c = std::max(signed_c, id(twc_vitals_current_c));
-            }
-
             // Household-only signal: TWC3's own vitals API gives us the
             // car's OWN per-phase current directly (twc_vitals_current_a/
             // b/c, see above), so it can be subtracted straight out of
@@ -603,10 +577,43 @@ script:
             // feedback loop), this removes the self-reference at its
             // actual source. Falls back to the car-inclusive signal
             // (0.0 default) if vitals hasn't reported yet -- less
-            // precise, still correct.
+            // precise, still correct. IMPORTANT: uses the RAW signed_x
+            // (no R1 floor applied -- see below for why).
             float household_a = signed_a - id(twc_vitals_current_a);
             float household_b = signed_b - id(twc_vitals_current_b);
             float household_c = signed_c - id(twc_vitals_current_c);
+
+            // R1 hard floor -- CORRELATION-ONLY, per the reference
+            // project: with the car genuinely charging, TWC3's own live
+            // ramp-tracking check needs the published "worst" term to
+            // read at least as high as what TWC3 itself measures the car
+            // drawing, or it may distrust the meter.
+            //
+            // Confirmed live (bug, now fixed): the floor must NOT feed
+            // household_x/desired_avail. It was originally applied to
+            // signed_x itself, upstream of household_x -- the moment the
+            // car drew current, signed_x collapsed toward
+            // vitals_current_x, so household_x = signed_x - vitals_current_x
+            // collapsed to ~0 REGARDLESS of real solar export, wiping out
+            // the whole budget and choking off every charge attempt (the
+            // car's own draw cancelled itself out of its own budget).
+            // Confirmed live too: real_a genuinely dropping while
+            // vitals_a rose (e.g. 7.97->2.80 as vitals rose 0->5.4) is
+            // physically correct -- still net EXPORTING overall, just a
+            // smaller surplus -- so signed_a must stay negative (export),
+            // never forced toward the car's raw branch current.
+            //
+            // Confirmed live also: contactor_closed can report true
+            // during brief near-zero (0.2-0.4A) self-test/idle blips, not
+            // just real charging -- gated on vehicle_current_a >= 2.0A too.
+            const bool car_charging = id(twc_vitals_contactor_closed) &&
+                (id(twc_vitals_vehicle_current) >= 2.0f);
+            float corr_a = signed_a, corr_b = signed_b, corr_c = signed_c;
+            if (car_charging) {
+              corr_a = std::max(corr_a, id(twc_vitals_current_a));
+              corr_b = std::max(corr_b, id(twc_vitals_current_b));
+              corr_c = std::max(corr_c, id(twc_vitals_current_c));
+            }
 
             // Desired available current -- how much we WANT the car
             // allowed, from the car-free household signal (no feedback
@@ -659,7 +666,7 @@ script:
             // car-INCLUSIVE signal for live 1:1 correlation below the
             // limit; compressed-and-capped excess above it; published
             // SYMMETRICALLY on all 3 registers.
-            float worst = std::max(std::max(signed_a, signed_b), signed_c);
+            float worst = std::max(std::max(corr_a, corr_b), corr_c);
             float bias_offset = twc_breaker - desired_avail;
             float o_raw = worst + bias_offset;
 
@@ -693,17 +700,20 @@ script:
                 last_header_ms = now_ms;
                 ESP_LOGI("csv_header",
                     "ts_ms,mode,real_a,real_b,real_c,signed_a,signed_b,signed_c,"
-                    "household_a,household_b,household_c,desired_avail,worst,o_raw,pub,"
-                    "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed");
+                    "corr_a,corr_b,corr_c,household_a,household_b,household_c,"
+                    "desired_avail,worst,o_raw,pub,"
+                    "fve_offset_kw,vitals_a,vitals_b,vitals_c,vitals_vehicle,contactor_closed,car_charging");
               }
               ESP_LOGI("csv",
-                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d",
+                  "%u,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d,%d",
                   now_ms, mode_str, real_a, real_b, real_c,
                   signed_a, signed_b, signed_c,
+                  corr_a, corr_b, corr_c,
                   household_a, household_b, household_c,
                   desired_avail, worst, o_raw, pub, fve_offset_kw,
                   id(twc_vitals_current_a), id(twc_vitals_current_b), id(twc_vitals_current_c),
-                  id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? 1 : 0);
+                  id(twc_vitals_vehicle_current), id(twc_vitals_contactor_closed) ? 1 : 0,
+                  car_charging ? 1 : 0);
             }
 
             // Escalation (secondary safety net): a 2-stage STEP function
