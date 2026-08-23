@@ -232,9 +232,13 @@ TWC3's stock behavior without touching the RS485 wiring or reflashing.
    - WiFi SSID/password, fallback AP password
    - API encryption key (`python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"`)
    - OTA password
-   - `twc_breaker_limit_a` — TWC's own sub-circuit breaker / internal Home
-     Load Management limit, set in the Tesla installer menu for TWC3 —
-     **must match exactly**, otherwise the limit will be offset
+   - `twc_breaker_limit_a` — the value entered in the Tesla installer app's
+     Home Load Management / CT clamps section for TWC3 — **must match
+     exactly**, otherwise the limit will be offset. This is typically the
+     physical branch breaker derated to 80% for continuous load (e.g. a
+     3x25A breaker → 20A here), not necessarily the breaker's own rating —
+     use whatever value is actually configured on the TWC3 itself, not a
+     recomputed one
    - `main_breaker_limit_a` — your main incomer breaker (measured by the
      Shelly Pro 3EM). Can be higher than `twc_breaker_limit_a` — the car is
      limited by whichever of the two is lower
