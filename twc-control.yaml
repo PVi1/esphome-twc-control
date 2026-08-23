@@ -123,6 +123,19 @@ substitutions:
   # release_slew_a_per_s, giving TWC3 time to visibly react (watch its
   # own vitals current) between each step instead of a big single jump.
   release_slew_a_per_s: "0.1"   # 0.5A per 5s
+  # post_correction_hold_ms: requested explicitly, to stop a rapid
+  # oscillation observed live -- after a correction (o_raw crosses the
+  # limit, forcing pub into the effective ~+1.1A band and confirmed to
+  # make TWC3 reduce the car's current), the release-rate limiter's
+  # "snap to twc_breaker" step only lasted ONE cycle before continuing
+  # its normal slow release below the limit -- the car immediately
+  # ramped back up in response (seeing plenty of room again), crossing
+  # the limit again within seconds, causing a tight repeating cycle
+  # (~1-2s period) between the excess band and just-under-the-limit.
+  # Now holds pub pinned at exactly twc_breaker_limit_a (not below) for
+  # this long after the LAST time a correction was needed, before
+  # resuming the normal slow release underneath it.
+  post_correction_hold_ms: "60000"   # 1 minute
   # min_charge_current_a / low_surplus_grace_ms: requested explicitly, to
   # cut down on contactor cycling (mechanical wear) from brief transient
   # surplus dips (a passing cloud). See the grace_active block in
@@ -352,6 +365,10 @@ globals:
     restore_value: no
     initial_value: "NAN"
   - id: pub_release_last_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: post_correction_hold_until_ms
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -819,6 +836,21 @@ script:
             // source's own startup/reconnect window -- so the limiter
             // only ever starts tracking from a value that's already
             // reflecting real conditions.
+            //
+            // post_correction_hold_ms (requested explicitly, fixes a
+            // rapid oscillation confirmed live): the "snap to
+            // twc_breaker" step above only lasted ONE cycle before the
+            // normal slow release continued underneath it -- the car
+            // immediately ramped back up seeing room again, re-crossing
+            // the limit within seconds (~1-2s repeating cycle). Refreshed
+            // every cycle a correction is actually needed (o_raw >
+            // twc_breaker); while within the hold window, pub stays
+            // pinned at exactly twc_breaker instead of continuing to
+            // ease below it.
+            if (o_raw > twc_breaker) {
+              id(post_correction_hold_until_ms) = now_ms + (uint32_t)${post_correction_hold_ms};
+            }
+
             if (now_ms < 15000 || std::isnan(id(pub_release_prev))) {
               id(pub_release_prev) = pub;
               id(pub_release_last_update_ms) = now_ms;
@@ -828,9 +860,10 @@ script:
             } else {
               float elapsed_s = (now_ms - id(pub_release_last_update_ms)) / 1000.0f;
               float floor_val;
-              if (id(pub_release_prev) > twc_breaker) {
-                // First step down from the excess zone: snap straight to
-                // the limit, never below, regardless of elapsed time.
+              if (id(pub_release_prev) > twc_breaker || now_ms < id(post_correction_hold_until_ms)) {
+                // First step down from the excess zone, OR still within
+                // the post-correction hold window: pin at the limit,
+                // never below, regardless of elapsed time.
                 floor_val = twc_breaker;
               } else {
                 float max_delta = (float)${release_slew_a_per_s} * std::max(elapsed_s, 0.001f);
