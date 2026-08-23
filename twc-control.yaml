@@ -111,18 +111,16 @@ substitutions:
   # release_slew_a_per_s, giving TWC3 time to visibly react (watch its
   # own vitals current) between each step instead of a big single jump.
   release_slew_a_per_s: "0.1"   # 0.5A per 5s
-  # min_charge_current_a / low_surplus_grace_ms: requested explicitly, to
-  # cut down on contactor cycling (mechanical wear) from brief transient
-  # surplus dips (a passing cloud): when the true household-derived
-  # desired_avail wants to drop below TWC3's own minimum charge current
-  # (5A), don't let it -- hold desired_avail floored at 5A ("tolerated
-  # minimum", the car keeps charging at its lowest rate) for up to
-  # low_surplus_grace_ms. Only if the deficit is STILL there once the
-  # grace period expires do we let desired_avail fall through to its true
-  # (possibly negative) value, which then correctly escalates reported
-  # past the limit and lets TWC3 stop the session -- the deliberate,
-  # final fallback, not the first response to every brief dip.
-  min_charge_current_a: "5.0"
+  # low_surplus_grace_ms: requested explicitly, to cut down on contactor
+  # cycling (mechanical wear) from brief transient surplus dips (a
+  # passing cloud). See the grace_active block in recompute_ct for the
+  # full rationale, including a first attempt (flooring desired_avail at
+  # a fixed minimum current) that didn't work -- TWC3 only ever ignores
+  # reported below its threshold or aborts above it, no proportional
+  # response exists, so the only lever that actually works is holding the
+  # PUBLISHED value at exactly twc_breaker_limit_a (never above) for up
+  # to low_surplus_grace_ms, instead of letting it enter the excess zone
+  # at all.
   low_surplus_grace_ms: "120000"   # 2 minutes
   # dither: small always-on alternation so "reported" is never perfectly
   # static for long, even at rest/fail-safe -- a genuinely static value
@@ -680,30 +678,6 @@ script:
             }
             desired_avail = std::min(desired_avail, twc_breaker);
 
-            // Low-surplus grace period (see min_charge_current_a /
-            // low_surplus_grace_ms above) -- FVE modes only, GRID mode
-            // never needs it (desired_avail is already pinned at
-            // twc_breaker there). A brief dip (e.g. a passing cloud)
-            // shouldn't escalate reported past the limit and cost the
-            // contactor a cycle -- tolerate holding the car at its own
-            // minimum for a while first.
-            bool grace_active = false;
-            if (!grid_mode) {
-              bool low_surplus = desired_avail < (float)${min_charge_current_a};
-              if (low_surplus) {
-                if (id(low_surplus_since_ms) == 0) id(low_surplus_since_ms) = now_ms;
-                uint32_t low_for = now_ms - id(low_surplus_since_ms);
-                if (low_for < (uint32_t)${low_surplus_grace_ms}) {
-                  grace_active = true;
-                  desired_avail = (float)${min_charge_current_a};
-                }
-                // else: grace expired, let the true (possibly negative)
-                // desired_avail fall through -- deliberate final fallback.
-              } else {
-                id(low_surplus_since_ms) = 0;
-              }
-            }
-
             // Slew-rate limit desired_avail (see desired_avail_slew_a_per_s
             // above) BEFORE the main-breaker clamp -- that clamp is a hard
             // safety limit and must react instantly/unslowed; only the
@@ -752,8 +726,38 @@ script:
             float bias_offset = twc_breaker - desired_avail;
             float o_raw = worst + bias_offset;
 
+            // Low-surplus grace period (see low_surplus_grace_ms above):
+            // requested explicitly, to cut down on contactor cycling
+            // (mechanical wear) from brief transient surplus dips (a
+            // passing cloud). Confirmed live -- first attempt (flooring
+            // desired_avail at a fixed 5A) didn't work: o_raw =
+            // worst + (breaker - desired_avail) stayed far over the limit
+            // regardless, because worst (the car's own real current, e.g.
+            // 7-8A) alone already exceeded that fixed floor -- the car
+            // itself had already stopped drawing by the time it could
+            // have mattered. Since we can't command the car to a specific
+            // current (TWC3 only ever ignores below its threshold or
+            // aborts above it -- confirmed repeatedly, no proportional
+            // response exists), the only lever that actually works is
+            // holding the PUBLISHED value itself at exactly twc_breaker
+            // (never above -- confirmed safe up to the limit) for up to
+            // grace_ms, instead of letting it enter the excess zone at
+            // all. Only once the grace period truly expires do we let it
+            // through -- the deliberate final fallback, not the first
+            // response to every brief dip.
+            bool grace_active = false;
+            if (!grid_mode && o_raw > twc_breaker) {
+              if (id(low_surplus_since_ms) == 0) id(low_surplus_since_ms) = now_ms;
+              uint32_t over_for = now_ms - id(low_surplus_since_ms);
+              if (over_for < (uint32_t)${low_surplus_grace_ms}) {
+                grace_active = true;
+              }
+            } else {
+              id(low_surplus_since_ms) = 0;
+            }
+
             float pub;
-            if (o_raw <= twc_breaker) {
+            if (o_raw <= twc_breaker || grace_active) {
               // Floor at 0: during strong export, worst (a phase's own
               // real current, negative while exporting) plus bias_offset
               // can go negative -- confirmed live (~5975W export -> pub
@@ -762,7 +766,12 @@ script:
               // availability (breaker - 0 = full breaker); anything more
               // negative adds no information, only untested territory for
               // TWC3's own correlation check.
-              pub = std::max(o_raw, 0.0f);
+              //
+              // Also caps at twc_breaker during grace_active: o_raw may
+              // be above the limit (that's what grace is tolerating), but
+              // the PUBLISHED value must never actually cross it while
+              // grace holds, or TWC3 would react anyway.
+              pub = std::max(std::min(o_raw, twc_breaker), 0.0f);
             } else {
               float excess = std::min(((float)${excess_gain}) * (o_raw - twc_breaker), (float)${excess_max_a});
               excess = std::max(excess, (float)${law_nudge_min_a});
