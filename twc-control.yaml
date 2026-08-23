@@ -571,11 +571,25 @@ script:
 
             // R1 hard floor, applied to the INPUT signal (per the
             // reference project -- not patched onto the output
-            // afterward): with the contactor closed, every phase carries
-            // at least the vehicle's own measured current on that branch
-            // -- a lower reading is physically impossible and (per the
-            // reference project) latches TWC3's distrust state.
-            if (id(twc_vitals_contactor_closed)) {
+            // afterward): with the car genuinely charging, every phase
+            // carries at least the vehicle's own measured current on that
+            // branch -- a lower reading is physically impossible and (per
+            // the reference project) latches TWC3's distrust state.
+            //
+            // Confirmed live (direct curl against /api/1/vitals): TWC3's
+            // own contactor_closed flag genuinely flickers true/false every
+            // ~2s while the car is plugged in but idle (a periodic
+            // self-test/precharge pulse, not real charging) -- with
+            // vehicle_current_a staying near 0.2-0.4A the whole time, far
+            // below TWC3's own 5A minimum charge current. Trusting
+            // contactor_closed alone made every one of those blips floor
+            // an exporting phase (e.g. signed=-7.00) up toward ~0, which
+            // then whipsawed desired_avail and the published value even
+            // with a completely static real household load. Gated instead
+            // on the car actually drawing meaningful current.
+            const bool car_charging = id(twc_vitals_contactor_closed) &&
+                (id(twc_vitals_vehicle_current) >= 2.0f);
+            if (car_charging) {
               signed_a = std::max(signed_a, id(twc_vitals_current_a));
               signed_b = std::max(signed_b, id(twc_vitals_current_b));
               signed_c = std::max(signed_c, id(twc_vitals_current_c));
@@ -824,9 +838,9 @@ interval:
     then:
       - script.execute: recompute_ct
 
-  # Direct poll of TWC3's own /api/1/vitals -- ground-truth diagnostic only
-  # (currentA/B/C_a, vehicle_current_a, contactor_closed), does not feed
-  # into recompute_ct or the control loop, purely for correlating against
+  # Direct poll of TWC3's own /api/1/vitals -- ground truth for the R1
+  # hard floor and the household-only signal in recompute_ct (see there),
+  # and also exposed as diagnostic sensors for correlating against
   # "reported" and Shelly's real currents.
   - interval: ${twc_vitals_poll_interval}
     then:
