@@ -109,20 +109,6 @@ substitutions:
   # while still tracking real, sustained solar/household changes over
   # seconds just fine.
   desired_avail_slew_a_per_s: "1.0"
-  # release_slew_a_per_s: max rate DECREASES to the final published value
-  # are allowed below twc_breaker_limit_a (increases stay instant -- an
-  # instant RISE in "reported" is protective, same philosophy as the
-  # anti-glitch firewall; only easing capacity back to the car needs
-  # caution). Confirmed live: worst (a phase's own raw real current, not
-  # slew-limited -- it must track 1:1 for TWC3's correlation check) can
-  # drop abruptly (e.g. the moment a session/phase disengages), yanking
-  # pub down in a single step even though desired_avail itself is already
-  # slew-limited. Requested explicitly: release budget cautiously --
-  # snap down to exactly twc_breaker_limit_a first (one step, not
-  # further), then ease down from there no faster than
-  # release_slew_a_per_s, giving TWC3 time to visibly react (watch its
-  # own vitals current) between each step instead of a big single jump.
-  release_slew_a_per_s: "0.1"   # 0.5A per 5s
   # post_correction_hold_ms: requested explicitly, to stop a rapid
   # oscillation observed live -- after a correction (o_raw crosses the
   # limit, forcing pub into the effective ~+1.1A band and confirmed to
@@ -367,15 +353,7 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  # --- pub release-rate limiter state (see release_slew_a_per_s above) ---
-  - id: pub_release_prev
-    type: float
-    restore_value: no
-    initial_value: "NAN"
-  - id: pub_release_last_update_ms
-    type: uint32_t
-    restore_value: no
-    initial_value: "0"
+  # --- post-correction hold state (see recompute_ct) ---
   - id: post_correction_hold_until_ms
     type: uint32_t
     restore_value: no
@@ -730,12 +708,8 @@ script:
             // several seconds ramping UP from 0 toward the true target,
             // during which the artificially-low desired_avail legitimately
             // computed a HIGH bias_offset -- pushing pub into the excess
-            // zone as a pure boot artifact, which the release-rate limiter
-            // then latched onto as if a real excess event had happened,
-            // holding reported artificially high for up to ~2 minutes
-            // after every boot/reflash. Fixed the same way pub_release_prev
-            // already is: pass the raw value through unlimited on the very
-            // first call after boot.
+            // zone as a pure boot artifact. Fixed by passing the raw
+            // value through unlimited on the very first call after boot.
             if (std::isnan(id(desired_avail_prev))) {
               id(desired_avail_prev) = desired_avail;
               id(desired_avail_last_update_ms) = now_ms;
@@ -838,34 +812,16 @@ script:
               pub = twc_breaker + excess;
             }
 
-            // Release-rate limiter (see release_slew_a_per_s above):
-            // RISES stay instant (protective); a DECREASE first snaps to
-            // exactly twc_breaker (one step, from anywhere above it),
-            // then eases down no faster than release_slew_a_per_s.
-            //
-            // Confirmed live (bug, now fixed): even with desired_avail's
-            // own boot-ramp fixed, some brief post-boot transient (exact
-            // source unconfirmed -- likely HA/vitals data still catching
-            // up before an "esphome logs" client could even connect to
-            // observe it) could still get latched as pub_release_prev's
-            // very first value, then held for up to ~2 minutes even
-            // though it was never a real excess event. Bypassed entirely
-            // for the first 15s after boot -- comfortably past every data
-            // source's own startup/reconnect window -- so the limiter
-            // only ever starts tracking from a value that's already
-            // reflecting real conditions.
-            //
-            // post_correction_hold_ms (requested explicitly, fixes a
-            // rapid oscillation confirmed live): the "snap to
-            // twc_breaker" step above only lasted ONE cycle before the
-            // normal slow release continued underneath it -- the car
-            // immediately ramped back up seeing room again, re-crossing
-            // the limit within seconds (~1-2s repeating cycle). Refreshed
-            // every cycle a correction is actually needed (o_raw >
-            // twc_breaker); while within the hold window, pub is floored
-            // relative to worst using the bias captured at the LAST
-            // correction (hold_bias_offset), not a flat twc_breaker
-            // constant.
+            // Post-correction hold (requested explicitly, fixes a rapid
+            // oscillation confirmed live): right after a correction
+            // (o_raw > twc_breaker), letting pub immediately fall back to
+            // its natural low value made the car ramp straight back up,
+            // re-crossing the limit within seconds (~1-2s repeating
+            // cycle, real contactor cycling observed). Refreshed every
+            // cycle a correction is actually needed; while within the
+            // hold window, pub is floored relative to worst using the
+            // bias captured at the LAST correction (hold_bias_offset),
+            // not a flat twc_breaker constant.
             //
             // Confirmed live (bug, now fixed): pinning pub at a flat,
             // unmoving twc_breaker for the whole hold window broke
@@ -875,38 +831,28 @@ script:
             // for a real combined-circuit meter (the car's own draw is
             // part of that circuit) and risks the exact distrust/abort
             // reaction the dither mechanism exists to avoid. Session
-            // aborted with a real 4.7kW surplus still available.
+            // aborted with a real 4.7kW surplus still available. Fixed by
+            // tracking worst 1:1 (correlation-safe) instead, only floored
+            // at twc_breaker so it can't drop low enough to invite a
+            // premature re-ramp.
+            //
+            // Requested explicitly: once the hold window ends, release
+            // immediately -- maximize surplus utilization, don't waste
+            // real availability crawling back down at a fixed rate. An
+            // earlier version rate-limited every decrease (even ones that
+            // never went through a hold at all) at a fixed 0.1A/s, which
+            // left reported sitting near the limit for up to ~2 minutes
+            // after conditions had already recovered. Removed -- the hold
+            // above is what actually prevents oscillation/contactor
+            // cycling; a further rate limit on top of it only cost
+            // unused surplus, it didn't add any additional safety.
             if (o_raw > twc_breaker) {
               id(post_correction_hold_until_ms) = now_ms + (uint32_t)${post_correction_hold_ms};
               id(hold_bias_offset) = bias_offset;
             }
-
-            if (now_ms < 15000 || std::isnan(id(pub_release_prev))) {
-              id(pub_release_prev) = pub;
-              id(pub_release_last_update_ms) = now_ms;
-            } else if (pub >= id(pub_release_prev)) {
-              id(pub_release_prev) = pub;
-              id(pub_release_last_update_ms) = now_ms;
-            } else {
-              float elapsed_s = (now_ms - id(pub_release_last_update_ms)) / 1000.0f;
-              float floor_val;
-              if (now_ms < id(post_correction_hold_until_ms)) {
-                // Still within the post-correction hold window: track
-                // worst 1:1 (correlation-safe) using the bias frozen at
-                // the last correction, floored at twc_breaker so it
-                // never drops low enough to invite a premature re-ramp.
-                floor_val = std::max(twc_breaker, worst + id(hold_bias_offset));
-              } else if (id(pub_release_prev) > twc_breaker) {
-                // First step down from the excess zone (hold already
-                // expired): snap straight to the limit, never below.
-                floor_val = twc_breaker;
-              } else {
-                float max_delta = (float)${release_slew_a_per_s} * std::max(elapsed_s, 0.001f);
-                floor_val = id(pub_release_prev) - max_delta;
-              }
+            if (now_ms < id(post_correction_hold_until_ms)) {
+              float floor_val = std::max(twc_breaker, worst + id(hold_bias_offset));
               pub = std::max(pub, floor_val);
-              id(pub_release_prev) = pub;
-              id(pub_release_last_update_ms) = now_ms;
             }
 
             pub += dither;
