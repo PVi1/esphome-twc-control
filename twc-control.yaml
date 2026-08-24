@@ -897,6 +897,35 @@ script:
               pub = std::max(pub, floor_val);
             }
 
+            // EXPERIMENTAL, test/zone-steering branch only: see
+            // switch.*_zone_steering_mode above for the full rationale.
+            // 4-band discrete steering, only once the car is actually
+            // charging (during ramp-up the existing real/natural o_raw
+            // computation above is left untouched). Placed AFTER hold so
+            // it fully overrides rather than being fought by it.
+            if (id(zone_steering_mode).state && car_charging) {
+              const float target = desired_avail;
+              const float actual = id(twc_vitals_vehicle_current);
+              const float tol = id(zone_steering_tolerance_a).state;
+              const float hard_excess = id(zone_steering_hard_excess_a).state;
+              const char *zone;
+              if (actual > target + hard_excess) {
+                pub = twc_breaker + 1.10f;   // hard stop band
+                zone = "HARD";
+              } else if (actual > target + tol) {
+                pub = twc_breaker + 0.95f;   // slow-decline band
+                zone = "SLOW";
+              } else if (actual < target - tol) {
+                pub = twc_breaker - 1.0f;    // increase band
+                zone = "INCREASE";
+              } else {
+                pub = twc_breaker + 0.20f;   // hold band
+                zone = "HOLD";
+              }
+              ESP_LOGI("zone_steering", "target=%.2f actual=%.2f -> %s pub=%.2f",
+                  target, actual, zone, pub);
+            }
+
             pub += dither;
 
             reported_a = reported_b = reported_c = pub;
@@ -955,7 +984,10 @@ script:
               // the timer isn't reset/restarted by grace suppressing it.
               if (id(capped_since_ms) == 0) id(capped_since_ms) = now_ms;
               uint32_t capped_for = now_ms - id(capped_since_ms);
-              if (!grace_active) {
+              // Also suppressed during zone_steering_mode (EXPERIMENTAL,
+              // test/zone-steering branch only) -- the 4-band steering
+              // logic already fully owns pub in that mode.
+              if (!grace_active && !(id(zone_steering_mode).state && car_charging)) {
                 if (capped_for >= (uint32_t)${escalation_timeout_ms}) {
                   reported_a = reported_b = reported_c = std::max(pub, twc_breaker + (float)${law_nudge_min_a});
                   if (!id(escalation_stage1_logged)) {
@@ -1029,6 +1061,31 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
 
+  # --- EXPERIMENTAL, test/zone-steering branch only -----------------------
+  # Requested explicitly, based on threshold-probe findings (see that
+  # branch): TWC3's correlation/distrust protection appears to only
+  # actively require reported to track real current during the initial
+  # RAMP-UP -- once a session is established, holding reported FIXED
+  # while the car's own current changes (in response to that reported
+  # value) did not visibly trigger distrust. This opens up steering the
+  # car's current directly via 4 discrete published bands (X =
+  # twc_breaker_limit_a), instead of one continuously-computed value:
+  #   pub < X            -> TWC increases current
+  #   X <= pub <= X+0.4   -> TWC holds current fixed at whatever it is now
+  #   X+0.85 <= pub <= X+1.05 -> slow decline (~20s+ delay, confirmed)
+  #   pub >= X+1.1        -> immediate/fast decline
+  # Only engages once car_charging is true (contactor closed, vehicle
+  # current >=2A) -- during ramp-up (not yet charging), the existing,
+  # already-confirmed-working real/natural computation is used unchanged
+  # (see the car_charging gate on o_raw earlier in this script). Default
+  # OFF -- must be turned on deliberately for a test session.
+  - platform: template
+    id: zone_steering_mode
+    name: "Zone Steering Mode"
+    icon: "mdi:stairs"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
 # ---------------------------------------------------------------------------
 # Runtime-adjustable manual export-balance offset (FVE modes only, see
 # recompute_ct). Symmetric across all 3 phases, in kW total (split evenly
@@ -1062,6 +1119,40 @@ number:
     initial_value: 0.0
     on_value:
       - script.execute: recompute_ct
+
+  # --- EXPERIMENTAL, test/zone-steering branch only -----------------------
+  # Deadband around desired_avail (the household-only target for the
+  # car's own current) before switching out of the HOLD band -- prevents
+  # rapid flapping between increase/hold/decline on small noise.
+  - platform: template
+    id: zone_steering_tolerance_a
+    name: "Zone Steering Tolerance"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 5.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.5
+
+  # How far vitals_vehicle_current has to exceed desired_avail before
+  # jumping straight to the HARD STOP band instead of the gentler SLOW
+  # DECLINE band -- i.e. how much overshoot is tolerated before giving up
+  # on a graceful reduction.
+  - platform: template
+    id: zone_steering_hard_excess_a
+    name: "Zone Steering Hard Excess"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 15.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 3.0
 
   # Low-surplus grace period duration (see the grace_active block in
   # recompute_ct) -- requested explicitly to be HA-adjustable at runtime
