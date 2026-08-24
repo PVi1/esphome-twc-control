@@ -1060,8 +1060,22 @@ script:
               // the natural value immediately, not wait out a stale
               // dwell window from whatever steering band was committed
               // right before reaching the floor.
+              //
+              // Confirmed live (bug, now fixed): the gate was symmetric,
+              // so a candidate EASING OFF (e.g. DESCEND_TO_FLOOR/+1.0A
+              // -> HOLD/+0.2A, a less aggressive band) got blocked by
+              // the same dwell timer as one escalating to something MORE
+              // aggressive -- leaving pub pinned at the higher value for
+              // up to zone_steering_min_dwell_s after the decision had
+              // already eased off. Matches the "rises trusted
+              // immediately, only increases in severity need caution"
+              // asymmetry used throughout this file (anti-glitch
+              // firewall, release logic, R1 floor) -- a DECREASE in pub
+              // is always accepted instantly; only an INCREASE is
+              // dwell-gated.
               if (is_handoff || std::isnan(id(zone_pub_committed)) ||
                   std::fabs(pub_candidate - id(zone_pub_committed)) < 0.01f ||
+                  pub_candidate <= id(zone_pub_committed) ||
                   now_ms - id(zone_pub_committed_since_ms) >= min_dwell_ms) {
                 id(zone_pub_committed) = pub_candidate;
                 id(zone_pub_committed_since_ms) = now_ms;
