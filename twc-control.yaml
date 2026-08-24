@@ -374,6 +374,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  - id: zone_steering_engaged
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: zone_was_floor_holding
+    type: bool
+    restore_value: no
+    initial_value: "false"
 
   # --- post-correction hold state (see recompute_ct) ---
   - id: post_correction_hold_until_ms
@@ -925,7 +933,27 @@ script:
             // charging (during ramp-up the existing real/natural o_raw
             // computation above is left untouched). Placed AFTER hold so
             // it fully overrides rather than being fought by it.
-            if (id(zone_steering_mode).state && car_charging) {
+            //
+            // Requested explicitly: auto-activate the instant reported
+            // first reaches twc_breaker_limit_a (X) -- no manual switch
+            // timing needed. Latches (zone_steering_engaged) so it stays
+            // active through normal SLOW/HOLD/INCREASE fluctuation, not
+            // re-evaluating the entry gate every cycle. Deactivates ONLY
+            // at the exact moment of releasing from an active FLOOR_HOLD
+            // (a real recovery, not just momentarily dipping under X) --
+            // handing control back to the fully natural algorithm; it
+            // re-engages automatically the next time reported reaches X
+            // again. Also resets whenever the car stops charging.
+            if (!car_charging) {
+              id(zone_steering_engaged) = false;
+              id(zone_was_floor_holding) = false;
+            }
+            if (id(zone_steering_mode).state && car_charging &&
+                !id(zone_steering_engaged) && o_raw >= twc_breaker) {
+              id(zone_steering_engaged) = true;
+            }
+
+            if (id(zone_steering_engaged)) {
               const float target = desired_avail;
               const float actual = id(twc_vitals_vehicle_current);
               const float tol = id(zone_steering_tolerance_a).state;
@@ -947,24 +975,34 @@ script:
                   if (held_for >= grace_ms) {
                     pub = twc_breaker + 1.10f;   // grace expired -- give up, real stop
                     zone = "HARD(grace expired)";
+                    id(zone_was_floor_holding) = false;  // committed to stop, not a recoverable hold anymore
                   } else {
                     pub = twc_breaker + 0.20f;   // hold at the floor, keep waiting
                     zone = "FLOOR_HOLD";
+                    id(zone_was_floor_holding) = true;
                   }
                 } else {
                   // Still above the floor -- controlled (SLOW-band)
                   // descent toward it, not yet holding.
                   id(zone_floor_hold_since_ms) = 0;
+                  id(zone_was_floor_holding) = false;
                   pub = twc_breaker + 0.95f;
                   zone = "DESCEND_TO_FLOOR";
                 }
               } else {
-                // Excess has shrunk back under hard_excess -- conditions
-                // recovered (or were never that bad). Release back to
-                // normal steering; grace timer resets so a FUTURE large
-                // deficit gets a fresh floor-hold window.
+                // Excess has shrunk back under hard_excess.
+                bool releasing_from_floor_hold = id(zone_was_floor_holding);
                 id(zone_floor_hold_since_ms) = 0;
-                if (actual > target + tol) {
+                id(zone_was_floor_holding) = false;
+                if (releasing_from_floor_hold) {
+                  // The specific deactivation moment requested: a REAL
+                  // recovery out of an active floor-hold (not merely
+                  // dipping under hard_excess in passing). Hand control
+                  // back to the natural algorithm -- pub already holds
+                  // whatever that computed earlier, left untouched here.
+                  id(zone_steering_engaged) = false;
+                  zone = "RELEASE(back to natural)";
+                } else if (actual > target + tol) {
                   pub = twc_breaker + 0.95f;   // slow-decline band
                   zone = "SLOW";
                 } else if (actual < target - tol) {
@@ -975,8 +1013,8 @@ script:
                   zone = "HOLD";
                 }
               }
-              ESP_LOGI("zone_steering", "target=%.2f actual=%.2f -> %s pub=%.2f",
-                  target, actual, zone, pub);
+              ESP_LOGI("zone_steering", "target=%.2f actual=%.2f engaged=%d -> %s pub=%.2f",
+                  target, actual, id(zone_steering_engaged) ? 1 : 0, zone, pub);
             }
 
             pub += dither;
@@ -1037,10 +1075,11 @@ script:
               // the timer isn't reset/restarted by grace suppressing it.
               if (id(capped_since_ms) == 0) id(capped_since_ms) = now_ms;
               uint32_t capped_for = now_ms - id(capped_since_ms);
-              // Also suppressed during zone_steering_mode (EXPERIMENTAL,
+              // Also suppressed while zone_steering_engaged (EXPERIMENTAL,
               // test/zone-steering branch only) -- the 4-band steering
-              // logic already fully owns pub in that mode.
-              if (!grace_active && !(id(zone_steering_mode).state && car_charging)) {
+              // logic (including its own floor-hold grace) already fully
+              // owns pub in that state.
+              if (!grace_active && !id(zone_steering_engaged)) {
                 if (capped_for >= (uint32_t)${escalation_timeout_ms}) {
                   reported_a = reported_b = reported_c = std::max(pub, twc_breaker + (float)${law_nudge_min_a});
                   if (!id(escalation_stage1_logged)) {
