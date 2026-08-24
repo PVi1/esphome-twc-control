@@ -90,8 +90,8 @@ substitutions:
   # any correction is actually needed, instead of lingering in the
   # hold band first.
   law_nudge_min_a: "1.1"
-  # desired_avail_slew_a_per_s: max rate of change allowed for
-  # desired_avail (our "budget"/target-setting term) per second. In the
+  # desired_avail_slew_down_a_per_s: max rate DESIRED_AVAIL is allowed to
+  # DECREASE per second (our "budget"/target-setting term). In the
   # reference project, "budget" is a fixed/slow-changing external quantity
   # (contract limit) or, when made dynamic via their HA orchestration
   # layer, explicitly rate-limited there (10s tick, <=0.5A/tick decay) --
@@ -104,11 +104,26 @@ substitutions:
   # newly-engaged phase's real draw) -- this fed straight into
   # desired_avail, spiking o_raw/pub right at the critical startup
   # window and appears to have caused TWC3 to abort the session. Slew-
-  # limiting desired_avail keeps it a genuinely slow-moving operating
-  # point again, absorbing sub-second desync noise from either source
-  # while still tracking real, sustained solar/household changes over
-  # seconds just fine.
-  desired_avail_slew_a_per_s: "1.0"
+  # limiting DECREASES keeps it a genuinely slow-moving operating point
+  # again, absorbing sub-second desync noise from either source while
+  # still tracking real, sustained solar/household changes over seconds
+  # just fine.
+  desired_avail_slew_down_a_per_s: "1.0"
+  # desired_avail_slew_up_a_per_s: requested explicitly, asymmetric from
+  # the down-rate above. Confirmed live: a brief passing cloud (a few
+  # seconds) pushed a real, genuine deficit -- worst (unslowed, tracks
+  # real current 1:1) spiked immediately, but once the cloud actually
+  # PASSED and real conditions recovered, desired_avail (and therefore
+  # bias_offset/o_raw/pub) only recovered at the same cautious 1A/s,
+  # leaving pub pinned in the excess band for several seconds after the
+  # real disturbance was already over. TWC3 appears to tolerate a BRIEF
+  # excess indication with a graceful reduction, but a SUSTAINED one
+  # (even if only sustained by our own slow recovery, not by reality)
+  # gets a hard stop instead. Recovering (desired_avail increasing) is
+  # protective the same way every other "rises stay instant" mechanism
+  # in this file is (anti-glitch firewall, release-rate limiter) -- only
+  # the DECREASE direction needs caution against desync noise.
+  desired_avail_slew_up_a_per_s: "10.0"
   # post_correction_hold_ms: requested explicitly, to stop a rapid
   # oscillation observed live -- after a correction (o_raw crosses the
   # limit, forcing pub into the effective ~+1.1A band and confirmed to
@@ -337,7 +352,7 @@ globals:
     initial_value: "false"
 
   # --- desired_avail slew-rate limiter state (see
-  #     desired_avail_slew_a_per_s above). ---
+  #     desired_avail_slew_down_a_per_s / desired_avail_slew_up_a_per_s above). ---
   - id: desired_avail_prev
     type: float
     restore_value: no
@@ -698,10 +713,15 @@ script:
             }
             desired_avail = std::min(desired_avail, twc_breaker);
 
-            // Slew-rate limit desired_avail (see desired_avail_slew_a_per_s
-            // above) BEFORE the main-breaker clamp -- that clamp is a hard
-            // safety limit and must react instantly/unslowed; only the
-            // soft, solar/household-derived target gets smoothed.
+            // Slew-rate limit desired_avail (see desired_avail_slew_down_a_per_s
+            // / desired_avail_slew_up_a_per_s above) BEFORE the
+            // main-breaker clamp -- that clamp is a hard safety limit and
+            // must react instantly/unslowed; only the soft,
+            // solar/household-derived target gets smoothed. Asymmetric:
+            // decreases stay cautious (desync-noise protection),
+            // increases recover fast (a brief cloud shouldn't leave pub
+            // pinned in the excess band long after conditions actually
+            // recovered -- see desired_avail_slew_up_a_per_s above).
             //
             // Confirmed live (bug, now fixed): starting desired_avail_prev
             // at a fixed 0.0 on boot made desired_avail spend its first
@@ -714,10 +734,12 @@ script:
               id(desired_avail_prev) = desired_avail;
               id(desired_avail_last_update_ms) = now_ms;
             } else {
-              const float slew_a_per_s = ${desired_avail_slew_a_per_s};
               float elapsed_s = (now_ms - id(desired_avail_last_update_ms)) / 1000.0f;
-              float max_delta = slew_a_per_s * std::max(elapsed_s, 0.001f);
               float delta = desired_avail - id(desired_avail_prev);
+              float slew_a_per_s = (delta >= 0.0f)
+                  ? (float)${desired_avail_slew_up_a_per_s}
+                  : (float)${desired_avail_slew_down_a_per_s};
+              float max_delta = slew_a_per_s * std::max(elapsed_s, 0.001f);
               delta = std::max(-max_delta, std::min(max_delta, delta));
               desired_avail = id(desired_avail_prev) + delta;
               id(desired_avail_prev) = desired_avail;
