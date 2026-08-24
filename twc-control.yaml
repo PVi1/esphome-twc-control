@@ -1053,6 +1053,38 @@ switch:
   # final published value is overridden. Escalation is suppressed while
   # active, so it can't interfere with a manual step held for >2min.
   # Default OFF -- must be turned on deliberately for a test session.
+  #
+  # FINDINGS (twc_breaker_limit_a = 20A, live testing this session):
+  # TWC3's reaction is NOT a sharp on/off threshold -- it's closer to a
+  # time-integrated response: larger excess reacts faster, smaller excess
+  # reacts slower, but (confirmed) EVERY tested value above the limit
+  # eventually causes a reduction given enough time -- there is no
+  # "hold forever" value.
+  #   pub=20.9 (+0.9A): first visible reduction only after several tens
+  #     of seconds; a full run held steady at 20.9A took the car from
+  #     13.1A down to 10A over ~175s, then held flat at 10A (did not
+  #     keep declining further while still at 20.9A -- saturates, does
+  #     not necessarily run all the way to zero on its own).
+  #   pub=21.0 / 21.05 (+1.0/+1.05A): reduction starts after ~20s
+  #     (confirmed twice independently), then a gradual/gentle decline.
+  #   pub=21.1 (+1.1A): reduction starts within seconds, cascading
+  #     several amps/second, reaching a full stop in ~3s. Confirmed NOT
+  #     reliably reversible by nudging the test value back down to 21.0
+  #     mid-cascade -- the car kept declining to a full stop regardless.
+  #   pub=21.2 / 21.5 / 22.0 (+1.2/+1.5/+2.0A): same fast/cascading
+  #     reaction as 21.1 -- reaction speed saturates around +1.1A, going
+  #     higher doesn't make it react meaningfully faster.
+  #   Recovery: switching threshold_test_mode fully OFF (letting the real
+  #     algorithm publish its natural low value) DURING an active
+  #     cascade was observed to let the car recover back up from a
+  #     partial drop (e.g. 6A) instead of continuing to a full stop --
+  #     merely nudging the TEST value back down to 21.0 mid-cascade did
+  #     NOT have the same effect.
+  # Practical implication: +1.0A gives ~20s of grace before TWC3 reacts
+  # at all -- enough for a genuinely brief (few-second) cloud to clear
+  # before any reaction starts. +1.1A and above should be avoided for
+  # routine corrections (jumps straight into the fast/cascading zone);
+  # reserve it only for a deliberate, final "stop the session" signal.
   - platform: template
     id: threshold_test_mode
     name: "Threshold Test Mode"
@@ -1129,7 +1161,7 @@ number:
     unit_of_measurement: "A"
     min_value: 0.0
     max_value: 25.0
-    step: 0.1
+    step: 0.01
     mode: box
     optimistic: true
     restore_value: true
