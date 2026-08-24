@@ -244,6 +244,15 @@ discrete bands, chosen by comparing the vehicle's own **actual** current
   fired): publish `twc_breaker_limit_a + 1.1A` — the confirmed-fast,
   reserved-for-a-real-persistent-excess band.
 
+TWC3's own live plausibility/correlation check on `reported` (§/"Publication
+law" above) appears to only really be active during the initial charging
+ramp-up — once the limit is reached and zone steering takes over, it
+doesn't seem to be a factor anymore, behavior is driven purely by the
+reaction-curve timing above. Not confirmed as a hard rule, but consistent
+with everything observed so far, and part of why zone steering can safely
+hold a fixed band value for multiple seconds without a correlation-distrust
+stop the way a static value would during ramp-up.
+
 **Auto-engage / handoff (latch)**: engages the instant the classic
 computation would publish `>= twc_breaker_limit_a` while charging, and
 stays engaged through normal fluctuation. The moment `actual` reaches

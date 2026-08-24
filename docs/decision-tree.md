@@ -313,6 +313,17 @@ vehicle's **actual** current (`twc_vitals_vehicle_current`) against
 `desired_avail` (the target). Only engages when the classic law would
 already be publishing at/above the limit while charging.
 
+TWC3's own live plausibility/correlation check on `reported` (comparing
+it against its own ramping current, see §4) appears to only really be
+active during the initial charging ramp-up. Once the limit is reached
+and zone steering takes over, that check doesn't seem to be a factor
+anymore — behavior at that point is driven purely by the reaction-curve
+timing in §8. Not confirmed as a hard rule yet, but consistent with
+everything observed so far, and part of why zone steering can safely
+hold a fixed band value for multiple seconds at a time without
+triggering a correlation-distrust stop the way a static value would
+during ramp-up (§5).
+
 ```mermaid
 flowchart TD
     E{"actual > target + hard_excess?"}
