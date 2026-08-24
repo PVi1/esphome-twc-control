@@ -382,6 +382,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  - id: zone_stuck_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: zone_stuck_baseline_a
+    type: float
+    restore_value: no
+    initial_value: "NAN"
   - id: zone_pub_committed
     type: float
     restore_value: no
@@ -954,6 +962,8 @@ script:
             // again. Also resets whenever the car stops charging.
             if (!car_charging) {
               id(zone_steering_engaged) = false;
+              id(zone_stuck_baseline_a) = NAN;
+              id(zone_stuck_since_ms) = 0;
             }
             if (id(zone_steering_mode).state && car_charging &&
                 !id(zone_steering_engaged) && o_raw >= twc_breaker) {
@@ -976,6 +986,25 @@ script:
               const char *zone;
               bool is_handoff = false;
 
+              // Stuck-timeout escalation (requested explicitly): confirmed
+              // live, SLOW/DESCEND_TO_FLOOR held for 8+ minutes straight
+              // with actual stabilized just above the floor, never
+              // handing off, TWC3 eventually aborting anyway. If actual
+              // hasn't shown real progress (a genuine decrease) for
+              // zone_steering_stuck_timeout_s while braking, escalate to
+              // +1.1A instead of holding the weaker brake_excess
+              // indefinitely. Reset (fresh baseline) whenever real
+              // progress is seen or braking wasn't needed last cycle.
+              bool braking_needed = (actual > target + hard_excess) || (actual > target + tol);
+              if (!braking_needed || std::isnan(id(zone_stuck_baseline_a)) ||
+                  actual < id(zone_stuck_baseline_a) - 0.3f) {
+                id(zone_stuck_baseline_a) = actual;
+                id(zone_stuck_since_ms) = now_ms;
+              }
+              const uint32_t stuck_timeout_ms = (uint32_t)(id(zone_steering_stuck_timeout_s).state * 1000.0f);
+              const float effective_excess = (braking_needed && (now_ms - id(zone_stuck_since_ms)) >= stuck_timeout_ms)
+                  ? 1.10f : brake_excess;
+
               if (actual > target + hard_excess) {
                 if (actual <= floor_a) {
                   // Requested explicitly: the moment the floor is first
@@ -993,6 +1022,8 @@ script:
                   // waiting.
                   id(zone_floor_hold_since_ms) = 0;
                   id(zone_steering_engaged) = false;
+                  id(zone_stuck_baseline_a) = NAN;
+                  id(zone_stuck_since_ms) = 0;
                   is_handoff = true;
                   zone = "FLOOR_REACHED(handoff to natural)";
                   // pub left as whatever the natural computation above
@@ -1013,16 +1044,16 @@ script:
                   // was already low/near the floor -- brake_excess above
                   // uses a gentler value there instead.
                   id(zone_floor_hold_since_ms) = 0;
-                  pub = twc_breaker + brake_excess;
-                  zone = "DESCEND_TO_FLOOR";
+                  pub = twc_breaker + effective_excess;
+                  zone = (effective_excess > brake_excess) ? "DESCEND_TO_FLOOR(stuck->1.1A)" : "DESCEND_TO_FLOOR";
                   id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
                 }
               } else {
                 // Excess has shrunk back under hard_excess.
                 id(zone_floor_hold_since_ms) = 0;
                 if (actual > target + tol) {
-                  pub = twc_breaker + brake_excess;   // slow-decline band
-                  zone = "SLOW";
+                  pub = twc_breaker + effective_excess;   // slow-decline band
+                  zone = (effective_excess > brake_excess) ? "SLOW(stuck->1.1A)" : "SLOW";
                   id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
                 } else if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
                   // Requested explicitly: don't let INCREASE re-engage
@@ -1370,6 +1401,29 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 0.90
+
+  # Requested explicitly: confirmed live, SLOW/DESCEND_TO_FLOOR
+  # (X+0.9/1.0A) held for 8+ minutes straight -- actual stabilized just
+  # above the floor (never technically reaching it, so FLOOR_REACHED
+  # handoff never fired) without ever escalating or handing off. TWC3
+  # eventually aborted anyway, apparently after enough cumulative time
+  # near the threshold, regardless of real-time conditions. If actual
+  # hasn't shown real progress (a genuine decrease) for this long while
+  # braking, escalate to X+1.1A (the confirmed-effective, faster-
+  # reacting band) instead of holding the weaker value indefinitely. See
+  # zone_stuck_since_ms / zone_stuck_baseline_a in recompute_ct.
+  - platform: template
+    id: zone_steering_stuck_timeout_s
+    name: "Zone Steering Stuck Timeout"
+    icon: "mdi:timer-alert-outline"
+    unit_of_measurement: "s"
+    min_value: 5.0
+    max_value: 900.0
+    step: 5.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 60.0
 
   # Requested explicitly: after ANY braking (SLOW/DESCEND_TO_FLOOR/
   # FLOOR_HOLD/HARD), don't let INCREASE re-engage immediately -- return
