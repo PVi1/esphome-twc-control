@@ -886,6 +886,21 @@ script:
             if (o_raw > twc_breaker) {
               id(post_correction_hold_until_ms) = now_ms + (uint32_t)${post_correction_hold_ms};
               id(hold_bias_offset) = bias_offset;
+            } else if (now_ms < id(post_correction_hold_until_ms)) {
+              // Confirmed live (bug, now fixed): hold_bias_offset was
+              // frozen at the deficit-time value for the WHOLE hold
+              // window, even once o_raw recovered back under the limit.
+              // desired_avail's fast (10A/s) recovery slew wasn't
+              // reflected in the hold floor at all -- pub stayed
+              // artificially pinned at the deficit-time level (e.g.
+              // 21.47A) for the rest of the hold window even after real
+              // conditions had already improved, and the session
+              // aborted anyway despite the fast-recovery fix. Let
+              // hold_bias_offset track any IMPROVEMENT (only ever
+              // decrease, never worsen from transient noise) while still
+              // in the hold window but no longer actively over the
+              // limit.
+              id(hold_bias_offset) = std::min(id(hold_bias_offset), bias_offset);
             }
             if (now_ms < id(post_correction_hold_until_ms)) {
               // Same car_charging gating as o_raw above -- worst only
