@@ -1176,7 +1176,7 @@ switch:
     name: "Zone Steering Mode"
     icon: "mdi:stairs"
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
+    restore_mode: RESTORE_DEFAULT_ON
 
 # ---------------------------------------------------------------------------
 # Runtime-adjustable manual export-balance offset (FVE modes only, see
@@ -1353,6 +1353,19 @@ binary_sensor:
     lambda: |-
       if (id(last_poll_ms) == 0) return false;
       return (millis() - id(last_poll_ms)) < 2000;
+
+  # --- EXPERIMENTAL, test/zone-steering branch only -----------------------
+  # Shows whether the 4-band zone-steering logic is REALLY in control of
+  # pub right now (ON), vs the classic real/natural algorithm (OFF) --
+  # distinct from switch.*_zone_steering_mode, which only enables the
+  # FEATURE; this reflects the actual latch state (zone_steering_engaged),
+  # which auto-activates on reaching twc_breaker_limit_a and only
+  # deactivates on a floor-hold release (see recompute_ct).
+  - platform: template
+    name: "Zone Steering Engaged"
+    icon: "mdi:stairs"
+    device_class: running
+    lambda: "return id(zone_steering_engaged);"
 
   # --- Is the Shelly data available? Mirrors the exact same debounced
   #     availability check recompute_ct uses for its fail-safe decision --
