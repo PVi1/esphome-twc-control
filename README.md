@@ -15,6 +15,10 @@ mirrored HA entities go stale, the firmware fails safe (0A available).
 Verified in practice: with **live, correlated** data, TWC3 keeps responding
 continuously throughout the whole charging session (not just at its start).
 
+📊 **[Full decision tree](docs/decision-tree.md)** — a diagrammed,
+section-by-section walkthrough of `recompute_ct`, including the
+zone-steering algorithm and the measured TWC3 reaction-curve findings.
+
 ## How it works
 
 ```
