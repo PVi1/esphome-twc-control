@@ -378,10 +378,6 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
-  - id: zone_was_floor_holding
-    type: bool
-    restore_value: no
-    initial_value: "false"
   - id: zone_brake_until_ms
     type: uint32_t
     restore_value: no
@@ -958,7 +954,6 @@ script:
             // again. Also resets whenever the car stops charging.
             if (!car_charging) {
               id(zone_steering_engaged) = false;
-              id(zone_was_floor_holding) = false;
             }
             if (id(zone_steering_mode).state && car_charging &&
                 !id(zone_steering_engaged) && o_raw >= twc_breaker) {
@@ -971,33 +966,34 @@ script:
               const float tol = id(zone_steering_tolerance_a).state;
               const float hard_excess = id(zone_steering_hard_excess_a).state;
               const float floor_a = id(zone_steering_floor_a).state;
-              const uint32_t grace_ms = (uint32_t)(id(low_surplus_grace_s).state * 1000.0f);
               const uint32_t recovery_hold_ms = (uint32_t)(id(zone_steering_recovery_hold_s).state * 1000.0f);
               const char *zone;
+              bool is_handoff = false;
 
               if (actual > target + hard_excess) {
-                // Large, persistent deficit. Requested explicitly: don't
-                // jump straight to HARD -- aim a controlled reduction at
-                // the floor current first, hold there for up to
-                // low_surplus_grace_period waiting for the cloud to
-                // pass, and only escalate to a real stop if it doesn't.
                 if (actual <= floor_a) {
-                  // Floor reached: hold, run the grace timer.
-                  if (id(zone_floor_hold_since_ms) == 0) id(zone_floor_hold_since_ms) = now_ms;
-                  uint32_t held_for = now_ms - id(zone_floor_hold_since_ms);
-                  if (held_for >= grace_ms) {
-                    pub = twc_breaker + 1.10f;   // grace expired -- give up, real stop
-                    zone = "HARD(grace expired)";
-                    id(zone_was_floor_holding) = false;  // committed to stop, not a recoverable hold anymore
-                  } else {
-                    pub = twc_breaker + 0.20f;   // hold at the floor, keep waiting
-                    zone = "FLOOR_HOLD";
-                    id(zone_was_floor_holding) = true;
-                  }
-                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
+                  // Requested explicitly: the moment the floor is first
+                  // reached, hand off IMMEDIATELY to the classic/natural
+                  // algorithm's own grace mechanism (grace_active,
+                  // low_surplus_grace_period -- already built for
+                  // exactly this "car near minimum, tolerate deficit
+                  // while waiting for the cloud" scenario, and its
+                  // default grace_vitals_threshold_a=7A already matches
+                  // this floor's default of 6.5A) instead of maintaining
+                  // a separate steering-owned FLOOR_HOLD state. Avoids
+                  // duplicating that logic and lets pub reflect real-time
+                  // conditions (worst-tracking, fast-recovery slew, hold)
+                  // instead of a steering-specific constant while
+                  // waiting.
+                  id(zone_floor_hold_since_ms) = 0;
+                  id(zone_steering_engaged) = false;
+                  is_handoff = true;
+                  zone = "FLOOR_REACHED(handoff to natural)";
+                  // pub left as whatever the natural computation above
+                  // already produced -- not overridden here.
                 } else {
                   // Still above the floor -- controlled (SLOW-band)
-                  // descent toward it, not yet holding.
+                  // descent toward it.
                   //
                   // Confirmed live (bug, now fixed): +0.95A was too weak
                   // -- held for 2.5+ minutes with vitals_vehicle_current
@@ -1008,25 +1004,14 @@ script:
                   // produces a reduction instead of silently doing
                   // nothing.
                   id(zone_floor_hold_since_ms) = 0;
-                  id(zone_was_floor_holding) = false;
                   pub = twc_breaker + 1.00f;
                   zone = "DESCEND_TO_FLOOR";
                   id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
                 }
               } else {
                 // Excess has shrunk back under hard_excess.
-                bool releasing_from_floor_hold = id(zone_was_floor_holding);
                 id(zone_floor_hold_since_ms) = 0;
-                id(zone_was_floor_holding) = false;
-                if (releasing_from_floor_hold) {
-                  // The specific deactivation moment requested: a REAL
-                  // recovery out of an active floor-hold (not merely
-                  // dipping under hard_excess in passing). Hand control
-                  // back to the natural algorithm -- pub already holds
-                  // whatever that computed earlier, left untouched here.
-                  id(zone_steering_engaged) = false;
-                  zone = "RELEASE(back to natural)";
-                } else if (actual > target + tol) {
+                if (actual > target + tol) {
                   pub = twc_breaker + 1.00f;   // slow-decline band
                   zone = "SLOW";
                   id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
@@ -1059,7 +1044,14 @@ script:
               // held sticky here.
               const float pub_candidate = pub;
               const uint32_t min_dwell_ms = (uint32_t)(id(zone_steering_min_dwell_s).state * 1000.0f);
-              if (std::isnan(id(zone_pub_committed)) ||
+              // Bypassed on the exact FLOOR_REACHED handoff cycle -- we
+              // just disengaged (zone_steering_engaged is now false for
+              // every future cycle), so this is a one-time transition,
+              // not a candidate that could flip-flop; it must publish
+              // the natural value immediately, not wait out a stale
+              // dwell window from whatever steering band was committed
+              // right before reaching the floor.
+              if (is_handoff || std::isnan(id(zone_pub_committed)) ||
                   std::fabs(pub_candidate - id(zone_pub_committed)) < 0.01f ||
                   now_ms - id(zone_pub_committed_since_ms) >= min_dwell_ms) {
                 id(zone_pub_committed) = pub_candidate;
