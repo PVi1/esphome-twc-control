@@ -897,6 +897,15 @@ script:
               pub = std::max(pub, floor_val);
             }
 
+            // DIAGNOSTIC, test/threshold-probe branch only: override with
+            // the manually-set test value. desired_avail/o_raw/worst above
+            // still ran and get logged normally (for comparison), only
+            // the final published number changes. Placed AFTER hold so
+            // hold can't fight the manual override.
+            if (id(threshold_test_mode).state) {
+              pub = id(test_reported_current_a).state;
+            }
+
             pub += dither;
 
             reported_a = reported_b = reported_c = pub;
@@ -955,7 +964,10 @@ script:
               // the timer isn't reset/restarted by grace suppressing it.
               if (id(capped_since_ms) == 0) id(capped_since_ms) = now_ms;
               uint32_t capped_for = now_ms - id(capped_since_ms);
-              if (!grace_active) {
+              // Also suppressed during threshold_test_mode (DIAGNOSTIC,
+              // test/threshold-probe branch only) -- a manual step held
+              // for >2min must not get overridden by escalation.
+              if (!grace_active && !id(threshold_test_mode).state) {
                 if (capped_for >= (uint32_t)${escalation_timeout_ms}) {
                   reported_a = reported_b = reported_c = std::max(pub, twc_breaker + (float)${law_nudge_min_a});
                   if (!id(escalation_stage1_logged)) {
@@ -1029,6 +1041,29 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
 
+  # --- DIAGNOSTIC, test/threshold-probe branch only -----------------------
+  # Threshold-probe test mode: overrides the computed pub with a manually
+  # set fixed value (number.*_test_reported_current_a below), letting the
+  # exact TWC3 reaction threshold relative to twc_breaker_limit_a be
+  # measured directly (step a fixed value, watch vitals_vehicle_current
+  # for a reaction) instead of inferred from live self-balancing noise.
+  # Does NOT touch desired_avail/o_raw/worst computation -- those still
+  # run and get logged normally (full CSV visibility into what the
+  # "natural" algorithm would have published, for comparison), only the
+  # final published value is overridden. Escalation is suppressed while
+  # active, so it can't interfere with a manual step held for >2min.
+  # Default OFF -- must be turned on deliberately for a test session.
+  - platform: template
+    id: threshold_test_mode
+    name: "Threshold Test Mode"
+    icon: "mdi:flask-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: recompute_ct
+    on_turn_off:
+      - script.execute: recompute_ct
+
 # ---------------------------------------------------------------------------
 # Runtime-adjustable manual export-balance offset (FVE modes only, see
 # recompute_ct). Symmetric across all 3 phases, in kW total (split evenly
@@ -1080,6 +1115,27 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 12.0
+
+  # --- DIAGNOSTIC, test/threshold-probe branch only -----------------------
+  # The exact value published to TWC3 while switch.*_threshold_test_mode is
+  # ON -- change this live to step 21.0 -> 21.1 -> 21.2 etc. and watch
+  # sensor.*_twc_vitals_vehicle_current for the reaction. on_value fires
+  # recompute_ct immediately so a change is published on the very next
+  # Modbus poll, not delayed to the next safety-net tick.
+  - platform: template
+    id: test_reported_current_a
+    name: "Test Reported Current"
+    icon: "mdi:flask-outline"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 25.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 20.0
+    on_value:
+      - script.execute: recompute_ct
 
 # ---------------------------------------------------------------------------
 # Safety-net recompute: recompute_ct is otherwise ONLY triggered by one of
