@@ -79,8 +79,10 @@ source).
   **household-only** signal (TWC3's own vitals API gives the car's OWN
   per-phase current directly, subtracted out of Shelly's combined reading,
   eliminating the self-referential feedback loop at its source instead of
-  damping it) — and **slew-rate-limited** (`desired_avail_slew_a_per_s`,
-  default 1A/s). This mirrors the reference project's own architecture: its
+  damping it) — and **asymmetrically slew-rate-limited**
+  (`desired_avail_slew_down_a_per_s`, 1A/s; `desired_avail_slew_up_a_per_s`,
+  10A/s — recovering availability is treated as protective/instant, only
+  declines are throttled). This mirrors the reference project's own architecture: its
   "budget" is a slow/external quantity, kept separate from the fast
   `worst` term used for correlation. Confirmed live: without this slew
   limit, Shelly and TWC3's own vitals API — two independently-polled
@@ -328,9 +330,11 @@ python3 -m venv venv
   rather than against it.
 - FVE mode is a bang-bang-flavored controller (not PID) — near `signed≈0`
   (exactly balanced) it may pulse slightly around zero grid exchange, and
-  the household-only self-balancing target is slew-rate-limited
-  (`desired_avail_slew_a_per_s`), so it deliberately does not react
-  instantly to a sudden load/export change.
+  the household-only self-balancing target is slew-rate-limited on the
+  way down (`desired_avail_slew_down_a_per_s`, 1A/s), so it deliberately
+  does not react instantly to a sudden load/export change in that
+  direction — but recovers quickly (`desired_avail_slew_up_a_per_s`,
+  10A/s) once conditions improve.
 - The register map (identification block, Neurio meter MAC/model/serial
   number) is a fixed placeholder taken from the reverse-engineered project
   linked below — it's not real data from any physical device.
