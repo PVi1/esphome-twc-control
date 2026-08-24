@@ -79,8 +79,10 @@ source).
   **household-only** signal (TWC3's own vitals API gives the car's OWN
   per-phase current directly, subtracted out of Shelly's combined reading,
   eliminating the self-referential feedback loop at its source instead of
-  damping it) — and **slew-rate-limited** (`desired_avail_slew_a_per_s`,
-  default 1A/s). This mirrors the reference project's own architecture: its
+  damping it) — and **asymmetrically slew-rate-limited**
+  (`desired_avail_slew_down_a_per_s`, 1A/s; `desired_avail_slew_up_a_per_s`,
+  10A/s — recovering availability is treated as protective/instant, only
+  declines are throttled). This mirrors the reference project's own architecture: its
   "budget" is a slow/external quantity, kept separate from the fast
   `worst` term used for correlation. Confirmed live: without this slew
   limit, Shelly and TWC3's own vitals API — two independently-polled
@@ -172,6 +174,116 @@ Either way, the per-phase main-breaker safety check
 (`main_breaker_limit_a - real`) still applies unconditionally, after
 slewing, so it's never delayed.
 
+### TWC3 reaction curve (threshold-probe findings, `twc_breaker_limit_a`=20A)
+
+Live-tested by publishing a fixed, manually-stepped `reported` value (a
+dedicated diagnostic test mode, `test/threshold-probe` branch — not part
+of production) and watching `twc_vitals_vehicle_current` for a reaction.
+The reaction is **not a sharp on/off threshold** — it behaves like a
+time-integrated/cumulative response: every tested value above the limit
+*eventually* causes a reduction given enough time, there is no value that
+holds forever, but how fast it reacts (and how far it goes before
+plateauing) depends heavily on how far past the limit it is:
+
+| excess over `twc_breaker_limit_a` | observed reaction |
+|---|---|
+| +0.9A | first visible reduction only after tens of seconds; can plateau for a while (e.g. 13.1A→10A over ~175s, then flat) but is **not safe indefinitely** — held long enough it resumes declining (10A→11A→10A over further ~80-175s in separate trials) |
+| +1.0 / +1.05A | reduction starts after ~20s in an isolated, static test, then a gradual decline — but this ~20s figure did **not** generalize to real/dynamic conditions: one live stop happened after only ~4s at flat +1.0A when the car's actual current was already low/near the floor (less headroom to brake before hitting it), and another sustained ~8 minutes of continuous +0.9-1.0A holding (actual stabilized just above the floor, a genuine small deficit) before TWC3 aborted anyway |
+| +1.1A and above (1.2/1.5/2.0A tested) | fast/cascading reduction within seconds, full stop in ~3s; reaction speed **saturates** around +1.1A — going higher doesn't react meaningfully faster |
+
+Recovery from a cascade requires fully exiting to the natural/low
+published value — nudging the published value down slightly mid-cascade
+does not reliably halt it once started.
+
+**Practical implication**: there's no single excess value that's both
+"fast enough to react to a real deficit" and "gentle enough to never
+overshoot into a stop" — a continuous law has to pick one operating
+point and live with its trade-off. This is what motivated **zone
+steering** below: instead of one value, react with an explicit sequence
+of increasingly firm bands, and escalate over time only if the gentler
+ones aren't working.
+
+### Zone steering (graceful degradation for transient deficits)
+
+The classic publication law above (a single, continuous excess value)
+reacts to a sudden production drop (a cloud) either too weakly — sitting
+in a real deficit for minutes before `escalation_timeout_ms` kicks in —
+or, if tuned more aggressively, too strongly, cascading into a full stop
+within seconds per the reaction curve above. Zone steering is an
+alternative response, active only once the classic law's own
+computation would already publish at or above `twc_breaker_limit_a`
+while charging: instead of one excess value, it publishes one of 4
+discrete bands, chosen by comparing the vehicle's own **actual** current
+(`twc_vitals_vehicle_current`) against `desired_avail` (the target):
+
+- **INCREASE** (`actual < target - tolerance`, and past a post-brake
+  recovery cooldown): publish `twc_breaker_limit_a - 1.0A`, i.e. let the
+  classic law's own below-limit tracking take back over.
+- **HOLD** (small deadband around target): publish
+  `twc_breaker_limit_a + 0.2A` — inside TWC3's ignored range, no
+  reaction, but keeps `reported` moving (correlation-safe) without
+  drifting toward a stop.
+- **SLOW / DESCEND_TO_FLOOR** (`actual` moderately over target): publish
+  `twc_breaker_limit_a + 0.9A` (confirmed-gentle per the reaction curve
+  above; `+0.9A` when `actual` is already below
+  `number.*_zone_steering_low_current_threshold_a`, `+1.0A` otherwise) —
+  deliberately below the fast-cascade zone, giving the car time to ease
+  down instead of dropping out.
+- **HARD** (`actual` far over target, or the *stuck-timeout* below has
+  fired): publish `twc_breaker_limit_a + 1.1A` — the confirmed-fast,
+  reserved-for-a-real-persistent-excess band.
+
+**Auto-engage / handoff (latch)**: engages the instant the classic
+computation would publish `>= twc_breaker_limit_a` while charging, and
+stays engaged through normal fluctuation. The moment `actual` reaches
+`number.*_zone_steering_floor_a` inside the HARD band, it disengages
+immediately and hands control back to the classic algorithm's own
+grace-period mechanism (rather than maintaining a separate floor-hold
+state with its own timer) — confirmed live that holding a separate
+floor-hold state let `actual` stabilize just above the floor (a real,
+small, sustained deficit) for 8+ minutes without ever escalating or
+handing off, and TWC3 eventually aborted anyway. Disengages fully on
+`!car_charging`, re-engaging fresh on the next threshold hit.
+
+**Stuck-timeout escalation** (`number.*_zone_steering_stuck_timeout_s`,
+default 60s, 5-900s range): if `actual` shows no real progress (no
+genuine >0.3A decrease from its baseline) while braking is needed for
+this long, SLOW/DESCEND_TO_FLOOR escalate to the HARD excess (+1.1A)
+instead of holding the weaker brake value indefinitely — added directly
+in response to the 8-minute stuck case above, for when `actual` never
+quite reaches the floor at all.
+
+**Minimum-dwell gate** (`number.*_zone_steering_min_dwell_s`, default
+3s): confirmed live, `desired_avail`'s fast recovery slew combined with
+a tight tolerance could make the target jitter across a band boundary
+several times per second, and every such flip reset TWC3's own internal
+"sustained excess" timer — so a correction never ran long enough
+uninterrupted to have any effect. The gate holds the last **published**
+value sticky for at least this long before accepting an escalation to a
+firmer band. Asymmetric: a decrease (easing off) is always accepted
+instantly, matching the "rises trusted immediately, only firming up
+needs caution" pattern used throughout this design (anti-glitch
+firewall, R1 floor, the release logic above) — only an *increase* in
+severity is dwell-gated.
+
+**Recovery-hold cooldown** (`number.*_zone_steering_recovery_hold_s`,
+default 10s): blocks INCREASE for this long after any braking cycle,
+falling through to HOLD instead — confirmed live, without it a brief dip
+of `actual` just under `target` right after a correction triggered an
+immediate ramp back up, undoing the correction it had just made.
+
+Entities: `switch.*_zone_steering_mode` (default **ON**, enables the
+whole mechanism), `binary_sensor.*_zone_steering_engaged` (is it
+actually steering right now vs. the classic algorithm running
+normally), `number.*_zone_steering_tolerance_a` (0.5A default),
+`number.*_zone_steering_hard_excess_a` (3.0A default — deadband before
+the HARD band, distinct from the fixed +1.1A HARD excess value itself),
+`number.*_zone_steering_floor_a` (6.5A default — where steering hands
+off), `number.*_zone_steering_low_current_threshold_a` (8.0A default)
+and `number.*_zone_steering_slow_brake_excess_a` (0.9A default — the
+gentler SLOW excess used below that threshold), `number.*_zone_steering_recovery_hold_s`,
+`number.*_zone_steering_min_dwell_s`, `number.*_zone_steering_stuck_timeout_s`.
+
 **Design history — earlier algorithm generations, kept for context.** The
 generations below all predate the discovery that TWC3 FW 26.26.1 doesn't
 proportionally track `reported` below its own breaker limit at all — they
@@ -232,9 +344,13 @@ TWC3's stock behavior without touching the RS485 wiring or reflashing.
    - WiFi SSID/password, fallback AP password
    - API encryption key (`python3 -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"`)
    - OTA password
-   - `twc_breaker_limit_a` — TWC's own sub-circuit breaker / internal Home
-     Load Management limit, set in the Tesla installer menu for TWC3 —
-     **must match exactly**, otherwise the limit will be offset
+   - `twc_breaker_limit_a` — the value entered in the Tesla installer app's
+     Home Load Management / CT clamps section for TWC3 — **must match
+     exactly**, otherwise the limit will be offset. This is typically the
+     physical branch breaker derated to 80% for continuous load (e.g. a
+     3x25A breaker → 20A here), not necessarily the breaker's own rating —
+     use whatever value is actually configured on the TWC3 itself, not a
+     recomputed one
    - `main_breaker_limit_a` — your main incomer breaker (measured by the
      Shelly Pro 3EM). Can be higher than `twc_breaker_limit_a` — the car is
      limited by whichever of the two is lower
@@ -304,6 +420,9 @@ python3 -m venv venv
   control" above.
 - `number.*_fve_offset` — manual kW offset added to the FVE-mode
   self-balancing target, runtime-adjustable in HA (`-5.0`..`+5.0`).
+- `switch.*_zone_steering_mode`, `binary_sensor.*_zone_steering_engaged`,
+  and the `number.*_zone_steering_*` tuning entities — see "Zone
+  steering" above.
 
 ## Known limitations / behavior
 
@@ -317,16 +436,21 @@ python3 -m venv venv
   polled directly (no HA dependency) but is used only as a diagnostic/
   supporting signal, not as a substitute data source for fail-safe purposes.
 - TWC3 FW 26.26.1 does **not** proportionally track `reported` below its own
-  configured breaker limit — confirmed live, repeatedly — it only reacts
-  once `reported` crosses the limit by ~1.1-1.2A. This is a firmware
-  behavior, not something this project can compute around; the whole
-  publication-law design (see "How it works" above) exists to work with it
+  configured breaker limit — confirmed live, repeatedly — and its reaction
+  above the limit is not a sharp threshold but a time-integrated response
+  that eventually reduces at any excess, reacting faster the further past
+  the limit `reported` sits (see "TWC3 reaction curve" above for the full
+  measured data). This is a firmware behavior, not something this project
+  can compute around; the whole publication-law design (see "How it works"
+  above) — and zone steering's discrete bands — exist to work with it
   rather than against it.
 - FVE mode is a bang-bang-flavored controller (not PID) — near `signed≈0`
   (exactly balanced) it may pulse slightly around zero grid exchange, and
-  the household-only self-balancing target is slew-rate-limited
-  (`desired_avail_slew_a_per_s`), so it deliberately does not react
-  instantly to a sudden load/export change.
+  the household-only self-balancing target is slew-rate-limited on the
+  way down (`desired_avail_slew_down_a_per_s`, 1A/s), so it deliberately
+  does not react instantly to a sudden load/export change in that
+  direction — but recovers quickly (`desired_avail_slew_up_a_per_s`,
+  10A/s) once conditions improve.
 - The register map (identification block, Neurio meter MAC/model/serial
   number) is a fixed placeholder taken from the reverse-engineered project
   linked below — it's not real data from any physical device.
