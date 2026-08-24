@@ -368,6 +368,13 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  # --- EXPERIMENTAL, test/zone-steering branch only: floor-hold grace
+  #     timer state (see zone_steering_mode block in recompute_ct) ---
+  - id: zone_floor_hold_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
   # --- post-correction hold state (see recompute_ct) ---
   - id: post_correction_hold_until_ms
     type: uint32_t
@@ -923,19 +930,50 @@ script:
               const float actual = id(twc_vitals_vehicle_current);
               const float tol = id(zone_steering_tolerance_a).state;
               const float hard_excess = id(zone_steering_hard_excess_a).state;
+              const float floor_a = id(zone_steering_floor_a).state;
+              const uint32_t grace_ms = (uint32_t)(id(low_surplus_grace_s).state * 1000.0f);
               const char *zone;
+
               if (actual > target + hard_excess) {
-                pub = twc_breaker + 1.10f;   // hard stop band
-                zone = "HARD";
-              } else if (actual > target + tol) {
-                pub = twc_breaker + 0.95f;   // slow-decline band
-                zone = "SLOW";
-              } else if (actual < target - tol) {
-                pub = twc_breaker - 1.0f;    // increase band
-                zone = "INCREASE";
+                // Large, persistent deficit. Requested explicitly: don't
+                // jump straight to HARD -- aim a controlled reduction at
+                // the floor current first, hold there for up to
+                // low_surplus_grace_period waiting for the cloud to
+                // pass, and only escalate to a real stop if it doesn't.
+                if (actual <= floor_a) {
+                  // Floor reached: hold, run the grace timer.
+                  if (id(zone_floor_hold_since_ms) == 0) id(zone_floor_hold_since_ms) = now_ms;
+                  uint32_t held_for = now_ms - id(zone_floor_hold_since_ms);
+                  if (held_for >= grace_ms) {
+                    pub = twc_breaker + 1.10f;   // grace expired -- give up, real stop
+                    zone = "HARD(grace expired)";
+                  } else {
+                    pub = twc_breaker + 0.20f;   // hold at the floor, keep waiting
+                    zone = "FLOOR_HOLD";
+                  }
+                } else {
+                  // Still above the floor -- controlled (SLOW-band)
+                  // descent toward it, not yet holding.
+                  id(zone_floor_hold_since_ms) = 0;
+                  pub = twc_breaker + 0.95f;
+                  zone = "DESCEND_TO_FLOOR";
+                }
               } else {
-                pub = twc_breaker + 0.20f;   // hold band
-                zone = "HOLD";
+                // Excess has shrunk back under hard_excess -- conditions
+                // recovered (or were never that bad). Release back to
+                // normal steering; grace timer resets so a FUTURE large
+                // deficit gets a fresh floor-hold window.
+                id(zone_floor_hold_since_ms) = 0;
+                if (actual > target + tol) {
+                  pub = twc_breaker + 0.95f;   // slow-decline band
+                  zone = "SLOW";
+                } else if (actual < target - tol) {
+                  pub = twc_breaker - 1.0f;    // increase band
+                  zone = "INCREASE";
+                } else {
+                  pub = twc_breaker + 0.20f;   // hold band
+                  zone = "HOLD";
+                }
               }
               ESP_LOGI("zone_steering", "target=%.2f actual=%.2f -> %s pub=%.2f",
                   target, actual, zone, pub);
@@ -1168,6 +1206,25 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 3.0
+
+  # Requested explicitly: on a large deficit (excess > hard_excess),
+  # don't jump straight to the HARD band -- aim a controlled (SLOW-band)
+  # reduction at this floor current first, hold there for up to
+  # number.*_low_surplus_grace_period waiting for conditions to recover,
+  # and only escalate to HARD if the grace period expires without
+  # recovery. See the zone_steering_mode block in recompute_ct.
+  - platform: template
+    id: zone_steering_floor_a
+    name: "Zone Steering Floor Current"
+    icon: "mdi:arrow-collapse-down"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 15.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 6.5
 
   # Low-surplus grace period duration (see the grace_active block in
   # recompute_ct) -- requested explicitly to be HA-adjustable at runtime
