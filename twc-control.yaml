@@ -368,6 +368,37 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  # --- EXPERIMENTAL, test/zone-steering branch only: floor-hold grace
+  #     timer state (see zone_steering_mode block in recompute_ct) ---
+  - id: zone_floor_hold_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: zone_steering_engaged
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: zone_brake_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: zone_stuck_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: zone_stuck_baseline_a
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: zone_pub_committed
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: zone_pub_committed_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
   # --- post-correction hold state (see recompute_ct) ---
   - id: post_correction_hold_until_ms
     type: uint32_t
@@ -912,6 +943,181 @@ script:
               pub = std::max(pub, floor_val);
             }
 
+            // EXPERIMENTAL, test/zone-steering branch only: see
+            // switch.*_zone_steering_mode above for the full rationale.
+            // 4-band discrete steering, only once the car is actually
+            // charging (during ramp-up the existing real/natural o_raw
+            // computation above is left untouched). Placed AFTER hold so
+            // it fully overrides rather than being fought by it.
+            //
+            // Requested explicitly: auto-activate the instant reported
+            // first reaches twc_breaker_limit_a (X) -- no manual switch
+            // timing needed. Latches (zone_steering_engaged) so it stays
+            // active through normal SLOW/HOLD/INCREASE fluctuation, not
+            // re-evaluating the entry gate every cycle. Deactivates ONLY
+            // at the exact moment of releasing from an active FLOOR_HOLD
+            // (a real recovery, not just momentarily dipping under X) --
+            // handing control back to the fully natural algorithm; it
+            // re-engages automatically the next time reported reaches X
+            // again. Also resets whenever the car stops charging.
+            if (!car_charging) {
+              id(zone_steering_engaged) = false;
+              id(zone_stuck_baseline_a) = NAN;
+              id(zone_stuck_since_ms) = 0;
+            }
+            if (id(zone_steering_mode).state && car_charging &&
+                !id(zone_steering_engaged) && o_raw >= twc_breaker) {
+              id(zone_steering_engaged) = true;
+            }
+
+            if (id(zone_steering_engaged)) {
+              const float target = desired_avail;
+              const float actual = id(twc_vitals_vehicle_current);
+              const float tol = id(zone_steering_tolerance_a).state;
+              const float hard_excess = id(zone_steering_hard_excess_a).state;
+              const float floor_a = id(zone_steering_floor_a).state;
+              const uint32_t recovery_hold_ms = (uint32_t)(id(zone_steering_recovery_hold_s).state * 1000.0f);
+              // Requested explicitly: less headroom to brake before the
+              // floor/a full stop when actual current is already low --
+              // use a gentler excess there.
+              const float brake_excess = (actual <= id(zone_steering_low_current_threshold_a).state)
+                  ? id(zone_steering_slow_brake_excess_a).state
+                  : 1.00f;
+              const char *zone;
+              bool is_handoff = false;
+
+              // Stuck-timeout escalation (requested explicitly): confirmed
+              // live, SLOW/DESCEND_TO_FLOOR held for 8+ minutes straight
+              // with actual stabilized just above the floor, never
+              // handing off, TWC3 eventually aborting anyway. If actual
+              // hasn't shown real progress (a genuine decrease) for
+              // zone_steering_stuck_timeout_s while braking, escalate to
+              // +1.1A instead of holding the weaker brake_excess
+              // indefinitely. Reset (fresh baseline) whenever real
+              // progress is seen or braking wasn't needed last cycle.
+              bool braking_needed = (actual > target + hard_excess) || (actual > target + tol);
+              if (!braking_needed || std::isnan(id(zone_stuck_baseline_a)) ||
+                  actual < id(zone_stuck_baseline_a) - 0.3f) {
+                id(zone_stuck_baseline_a) = actual;
+                id(zone_stuck_since_ms) = now_ms;
+              }
+              const uint32_t stuck_timeout_ms = (uint32_t)(id(zone_steering_stuck_timeout_s).state * 1000.0f);
+              const float effective_excess = (braking_needed && (now_ms - id(zone_stuck_since_ms)) >= stuck_timeout_ms)
+                  ? 1.10f : brake_excess;
+
+              if (actual > target + hard_excess) {
+                if (actual <= floor_a) {
+                  // Requested explicitly: the moment the floor is first
+                  // reached, hand off IMMEDIATELY to the classic/natural
+                  // algorithm's own grace mechanism (grace_active,
+                  // low_surplus_grace_period -- already built for
+                  // exactly this "car near minimum, tolerate deficit
+                  // while waiting for the cloud" scenario, and its
+                  // default grace_vitals_threshold_a=7A already matches
+                  // this floor's default of 6.5A) instead of maintaining
+                  // a separate steering-owned FLOOR_HOLD state. Avoids
+                  // duplicating that logic and lets pub reflect real-time
+                  // conditions (worst-tracking, fast-recovery slew, hold)
+                  // instead of a steering-specific constant while
+                  // waiting.
+                  id(zone_floor_hold_since_ms) = 0;
+                  id(zone_steering_engaged) = false;
+                  id(zone_stuck_baseline_a) = NAN;
+                  id(zone_stuck_since_ms) = 0;
+                  is_handoff = true;
+                  zone = "FLOOR_REACHED(handoff to natural)";
+                  // pub left as whatever the natural computation above
+                  // already produced -- not overridden here.
+                } else {
+                  // Still above the floor -- controlled (SLOW-band)
+                  // descent toward it.
+                  //
+                  // Confirmed live (bug, now fixed): +0.95A flat was too
+                  // weak above the low-current threshold -- held for
+                  // 2.5+ minutes with vitals_vehicle_current NOT moving
+                  // at all (a real, persistent ~700W import sat
+                  // uncorrected). Below the threshold-probe-confirmed
+                  // effective floor (+1.0A, ~20s delay in that isolated
+                  // test). Raised to +1.0A above the low-current
+                  // threshold. But ALSO confirmed live: a stop at
+                  // +1.0A took only ~4s (not ~20s) when actual current
+                  // was already low/near the floor -- brake_excess above
+                  // uses a gentler value there instead.
+                  id(zone_floor_hold_since_ms) = 0;
+                  pub = twc_breaker + effective_excess;
+                  zone = (effective_excess > brake_excess) ? "DESCEND_TO_FLOOR(stuck->1.1A)" : "DESCEND_TO_FLOOR";
+                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
+                }
+              } else {
+                // Excess has shrunk back under hard_excess.
+                id(zone_floor_hold_since_ms) = 0;
+                if (actual > target + tol) {
+                  pub = twc_breaker + effective_excess;   // slow-decline band
+                  zone = (effective_excess > brake_excess) ? "SLOW(stuck->1.1A)" : "SLOW";
+                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
+                } else if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
+                  // Requested explicitly: don't let INCREASE re-engage
+                  // immediately after braking -- confirmed live that
+                  // with zone_steering_tolerance_a=0, the instant actual
+                  // dipped below target the car ramped straight back up
+                  // from a correction, defeating the point of having
+                  // braked at all. Blocked for
+                  // zone_steering_recovery_hold_s after any braking
+                  // (SLOW/DESCEND_TO_FLOOR/FLOOR_HOLD/HARD) -- falls
+                  // through to HOLD below until the cooldown expires.
+                  pub = twc_breaker - 1.0f;    // increase band
+                  zone = "INCREASE";
+                } else {
+                  pub = twc_breaker + 0.20f;   // hold band
+                  zone = "HOLD";
+                }
+              }
+              // Minimum-dwell gate (see number.*_zone_steering_min_dwell
+              // above for the full rationale): only accept this cycle's
+              // candidate pub as a real change if it differs from the
+              // currently-committed value AND enough time has passed
+              // since that value was committed. Otherwise republish the
+              // committed value unchanged, rejecting the flip-flop.
+              // Internal state above (grace timers, floor-hold flags,
+              // brake-until) still updates every cycle based on the true
+              // instantaneous decision -- only the PUBLISHED number is
+              // held sticky here.
+              const float pub_candidate = pub;
+              const uint32_t min_dwell_ms = (uint32_t)(id(zone_steering_min_dwell_s).state * 1000.0f);
+              // Bypassed on the exact FLOOR_REACHED handoff cycle -- we
+              // just disengaged (zone_steering_engaged is now false for
+              // every future cycle), so this is a one-time transition,
+              // not a candidate that could flip-flop; it must publish
+              // the natural value immediately, not wait out a stale
+              // dwell window from whatever steering band was committed
+              // right before reaching the floor.
+              //
+              // Confirmed live (bug, now fixed): the gate was symmetric,
+              // so a candidate EASING OFF (e.g. DESCEND_TO_FLOOR/+1.0A
+              // -> HOLD/+0.2A, a less aggressive band) got blocked by
+              // the same dwell timer as one escalating to something MORE
+              // aggressive -- leaving pub pinned at the higher value for
+              // up to zone_steering_min_dwell_s after the decision had
+              // already eased off. Matches the "rises trusted
+              // immediately, only increases in severity need caution"
+              // asymmetry used throughout this file (anti-glitch
+              // firewall, release logic, R1 floor) -- a DECREASE in pub
+              // is always accepted instantly; only an INCREASE is
+              // dwell-gated.
+              if (is_handoff || std::isnan(id(zone_pub_committed)) ||
+                  std::fabs(pub_candidate - id(zone_pub_committed)) < 0.01f ||
+                  pub_candidate <= id(zone_pub_committed) ||
+                  now_ms - id(zone_pub_committed_since_ms) >= min_dwell_ms) {
+                id(zone_pub_committed) = pub_candidate;
+                id(zone_pub_committed_since_ms) = now_ms;
+              } else {
+                pub = id(zone_pub_committed);
+              }
+
+              ESP_LOGI("zone_steering", "target=%.2f actual=%.2f engaged=%d -> %s pub=%.2f (committed=%.2f)",
+                  target, actual, id(zone_steering_engaged) ? 1 : 0, zone, pub, id(zone_pub_committed));
+            }
+
             pub += dither;
 
             reported_a = reported_b = reported_c = pub;
@@ -970,7 +1176,11 @@ script:
               // the timer isn't reset/restarted by grace suppressing it.
               if (id(capped_since_ms) == 0) id(capped_since_ms) = now_ms;
               uint32_t capped_for = now_ms - id(capped_since_ms);
-              if (!grace_active) {
+              // Also suppressed while zone_steering_engaged (EXPERIMENTAL,
+              // test/zone-steering branch only) -- the 4-band steering
+              // logic (including its own floor-hold grace) already fully
+              // owns pub in that state.
+              if (!grace_active && !id(zone_steering_engaged)) {
                 if (capped_for >= (uint32_t)${escalation_timeout_ms}) {
                   reported_a = reported_b = reported_c = std::max(pub, twc_breaker + (float)${law_nudge_min_a});
                   if (!id(escalation_stage1_logged)) {
@@ -1044,6 +1254,31 @@ switch:
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
 
+  # --- EXPERIMENTAL, test/zone-steering branch only -----------------------
+  # Requested explicitly, based on threshold-probe findings (see that
+  # branch): TWC3's correlation/distrust protection appears to only
+  # actively require reported to track real current during the initial
+  # RAMP-UP -- once a session is established, holding reported FIXED
+  # while the car's own current changes (in response to that reported
+  # value) did not visibly trigger distrust. This opens up steering the
+  # car's current directly via 4 discrete published bands (X =
+  # twc_breaker_limit_a), instead of one continuously-computed value:
+  #   pub < X            -> TWC increases current
+  #   X <= pub <= X+0.4   -> TWC holds current fixed at whatever it is now
+  #   X+0.85 <= pub <= X+1.05 -> slow decline (~20s+ delay, confirmed)
+  #   pub >= X+1.1        -> immediate/fast decline
+  # Only engages once car_charging is true (contactor closed, vehicle
+  # current >=2A) -- during ramp-up (not yet charging), the existing,
+  # already-confirmed-working real/natural computation is used unchanged
+  # (see the car_charging gate on o_raw earlier in this script). Default
+  # OFF -- must be turned on deliberately for a test session.
+  - platform: template
+    id: zone_steering_mode
+    name: "Zone Steering Mode"
+    icon: "mdi:stairs"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
 # ---------------------------------------------------------------------------
 # Runtime-adjustable manual export-balance offset (FVE modes only, see
 # recompute_ct). Symmetric across all 3 phases, in kW total (split evenly
@@ -1077,6 +1312,165 @@ number:
     initial_value: 0.0
     on_value:
       - script.execute: recompute_ct
+
+  # --- EXPERIMENTAL, test/zone-steering branch only -----------------------
+  # Deadband around desired_avail (the household-only target for the
+  # car's own current) before switching out of the HOLD band -- prevents
+  # rapid flapping between increase/hold/decline on small noise.
+  - platform: template
+    id: zone_steering_tolerance_a
+    name: "Zone Steering Tolerance"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 5.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.5
+
+  # How far vitals_vehicle_current has to exceed desired_avail before
+  # jumping straight to the HARD STOP band instead of the gentler SLOW
+  # DECLINE band -- i.e. how much overshoot is tolerated before giving up
+  # on a graceful reduction.
+  - platform: template
+    id: zone_steering_hard_excess_a
+    name: "Zone Steering Hard Excess"
+    icon: "mdi:tune-variant"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 15.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 3.0
+
+  # Requested explicitly: on a large deficit (excess > hard_excess),
+  # don't jump straight to the HARD band -- aim a controlled (SLOW-band)
+  # reduction at this floor current first, hold there for up to
+  # number.*_low_surplus_grace_period waiting for conditions to recover,
+  # and only escalate to HARD if the grace period expires without
+  # recovery. See the zone_steering_mode block in recompute_ct.
+  - platform: template
+    id: zone_steering_floor_a
+    name: "Zone Steering Floor Current"
+    icon: "mdi:arrow-collapse-down"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 15.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 6.5
+
+  # Requested explicitly: confirmed live, a stop at pub=+1.0A took only
+  # ~4s instead of the ~20s confirmed in the isolated threshold-probe
+  # test -- there's less room to brake before hitting the floor/zero
+  # when actual current is already low, so a gentler (lower-excess)
+  # correction is used near the floor; above this threshold, brake as
+  # before (see zone_steering_slow_brake_excess_a).
+  - platform: template
+    id: zone_steering_low_current_threshold_a
+    name: "Zone Steering Low Current Threshold"
+    icon: "mdi:speedometer-slow"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 20.0
+    step: 0.1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 8.0
+
+  # Excess used for SLOW/DESCEND_TO_FLOOR when actual is AT OR BELOW
+  # zone_steering_low_current_threshold_a -- gentler than the normal
+  # +1.0A used above that threshold, since there's less headroom to
+  # brake before the floor/a full stop.
+  - platform: template
+    id: zone_steering_slow_brake_excess_a
+    name: "Zone Steering Slow Brake Excess"
+    icon: "mdi:speedometer-slow"
+    unit_of_measurement: "A"
+    min_value: 0.0
+    max_value: 2.0
+    step: 0.05
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 0.90
+
+  # Requested explicitly: confirmed live, SLOW/DESCEND_TO_FLOOR
+  # (X+0.9/1.0A) held for 8+ minutes straight -- actual stabilized just
+  # above the floor (never technically reaching it, so FLOOR_REACHED
+  # handoff never fired) without ever escalating or handing off. TWC3
+  # eventually aborted anyway, apparently after enough cumulative time
+  # near the threshold, regardless of real-time conditions. If actual
+  # hasn't shown real progress (a genuine decrease) for this long while
+  # braking, escalate to X+1.1A (the confirmed-effective, faster-
+  # reacting band) instead of holding the weaker value indefinitely. See
+  # zone_stuck_since_ms / zone_stuck_baseline_a in recompute_ct.
+  - platform: template
+    id: zone_steering_stuck_timeout_s
+    name: "Zone Steering Stuck Timeout"
+    icon: "mdi:timer-alert-outline"
+    unit_of_measurement: "s"
+    min_value: 5.0
+    max_value: 900.0
+    step: 5.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 60.0
+
+  # Requested explicitly: after ANY braking (SLOW/DESCEND_TO_FLOOR/
+  # FLOOR_HOLD/HARD), don't let INCREASE re-engage immediately -- return
+  # to HOLD (pub=X+0.2) first and force it for this many seconds,
+  # regardless of actual vs target. Confirmed live: with
+  # zone_steering_tolerance_a=0, the instant actual dipped below target
+  # the car ramped straight back up from a correction, defeating the
+  # point of having braked at all. See zone_brake_until_ms in
+  # recompute_ct.
+  - platform: template
+    id: zone_steering_recovery_hold_s
+    name: "Zone Steering Recovery Hold"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 60.0
+    step: 1.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 10.0
+
+  # Requested explicitly: confirmed live, the published value was
+  # flapping between bands multiple times per second (target/desired_avail
+  # jittering across the hard_excess boundary, especially with the fast
+  # 10A/s up-slew combined with tight tolerance/hard_excess settings) --
+  # every dip back to HOLD/INCREASE reset whatever internal
+  # "sustained excess" timer TWC3 uses, so DESCEND_TO_FLOOR (+1.0A)
+  # never got to run long enough uninterrupted to actually trigger a
+  # reaction (confirmed: vitals_vehicle_current frozen for 55+ seconds
+  # despite pub sitting mostly at +1.0A the whole time). Minimum time a
+  # newly-chosen band must be held before a DIFFERENT band is allowed to
+  # take over -- rejects rapid flip-flopping, republishing the
+  # previously-committed value instead until the dwell time elapses. See
+  # zone_pub_committed / zone_pub_committed_since_ms in recompute_ct.
+  - platform: template
+    id: zone_steering_min_dwell_s
+    name: "Zone Steering Min Dwell"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 30.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 3.0
 
   # Low-surplus grace period duration (see the grace_active block in
   # recompute_ct) -- requested explicitly to be HA-adjustable at runtime
@@ -1166,6 +1560,19 @@ binary_sensor:
     lambda: |-
       if (id(last_poll_ms) == 0) return false;
       return (millis() - id(last_poll_ms)) < 2000;
+
+  # --- EXPERIMENTAL, test/zone-steering branch only -----------------------
+  # Shows whether the 4-band zone-steering logic is REALLY in control of
+  # pub right now (ON), vs the classic real/natural algorithm (OFF) --
+  # distinct from switch.*_zone_steering_mode, which only enables the
+  # FEATURE; this reflects the actual latch state (zone_steering_engaged),
+  # which auto-activates on reaching twc_breaker_limit_a and only
+  # deactivates on a floor-hold release (see recompute_ct).
+  - platform: template
+    name: "Zone Steering Engaged"
+    icon: "mdi:stairs"
+    device_class: running
+    lambda: "return id(zone_steering_engaged);"
 
   # --- Is the Shelly data available? Mirrors the exact same debounced
   #     availability check recompute_ct uses for its fail-safe decision --
