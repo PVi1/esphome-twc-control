@@ -382,7 +382,13 @@ TWC3's stock behavior without touching the RS485 wiring or reflashing.
    branch too) — otherwise the formula in `recompute_ct` doesn't hold.
 3. In Home Assistant, confirm the 6 entities from step 1 exist and update
    with the Shelly's own refresh cadence — no further config needed, the
-   firmware reads them directly by entity ID.
+   firmware reads them directly by entity ID. This project's own Shelly
+   is configured for **Modbus polling at a 1s update interval** in HA
+   (instead of Shelly's default RPC-push integration, which updates every
+   ~5-15s) — not a fix for a problem with the classic RPC integration,
+   just tighter surplus-tracking precision on top of it; the classic
+   RPC-based integration works fine too, just at coarser granularity (see
+   TODO below).
 4. In Home Assistant, create the `input_boolean` helper referenced by
    `ha_charge_from_grid_entity` (Helpers → Toggle). If it doesn't exist, the
    firmware safely falls back to GRID mode.
@@ -465,6 +471,24 @@ python3 -m venv venv
 - The register map (identification block, Neurio meter MAC/model/serial
   number) is a fixed placeholder taken from the reverse-engineered project
   linked below — it's not real data from any physical device.
+
+**This project is a work in progress.** Initial results are good, but
+more testing (more sessions, more weather/load conditions, longer runs)
+is still needed before treating any part of it — the classic publication
+law or zone steering — as fully settled.
+
+## TODO
+
+- Verify the actual impact of reverting to the original RPC-based Shelly
+  update interval (~5-15s) vs. the current Modbus-polled 1s interval —
+  quantify how much (if any) surplus-tracking precision is actually lost
+  at the coarser cadence, since the classic RPC integration is simpler to
+  set up and doesn't need Modbus configured on the Shelly.
+- Investigate removing Home Assistant as a hard dependency entirely:
+  pulling current/power values directly from the Shelly (no HA in the
+  data path for power control), plus a local web UI on the ESP32 itself
+  for configuring the runtime-adjustable variables currently exposed only
+  as HA `number`/`switch` entities.
 
 ## Sources
 
