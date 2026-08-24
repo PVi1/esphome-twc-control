@@ -984,9 +984,18 @@ script:
                 } else {
                   // Still above the floor -- controlled (SLOW-band)
                   // descent toward it, not yet holding.
+                  //
+                  // Confirmed live (bug, now fixed): +0.95A was too weak
+                  // -- held for 2.5+ minutes with vitals_vehicle_current
+                  // NOT moving at all (a real, persistent ~700W import
+                  // sat uncorrected the whole time). Below the
+                  // threshold-probe-confirmed effective floor (+1.0A,
+                  // ~20s delay). Raised to +1.0A so this band actually
+                  // produces a reduction instead of silently doing
+                  // nothing.
                   id(zone_floor_hold_since_ms) = 0;
                   id(zone_was_floor_holding) = false;
-                  pub = twc_breaker + 0.95f;
+                  pub = twc_breaker + 1.00f;
                   zone = "DESCEND_TO_FLOOR";
                 }
               } else {
@@ -1003,7 +1012,7 @@ script:
                   id(zone_steering_engaged) = false;
                   zone = "RELEASE(back to natural)";
                 } else if (actual > target + tol) {
-                  pub = twc_breaker + 0.95f;   // slow-decline band
+                  pub = twc_breaker + 1.00f;   // slow-decline band
                   zone = "SLOW";
                 } else if (actual < target - tol) {
                   pub = twc_breaker - 1.0f;    // increase band
