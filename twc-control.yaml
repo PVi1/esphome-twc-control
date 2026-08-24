@@ -382,6 +382,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: "false"
+  - id: zone_brake_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
 
   # --- post-correction hold state (see recompute_ct) ---
   - id: post_correction_hold_until_ms
@@ -960,6 +964,7 @@ script:
               const float hard_excess = id(zone_steering_hard_excess_a).state;
               const float floor_a = id(zone_steering_floor_a).state;
               const uint32_t grace_ms = (uint32_t)(id(low_surplus_grace_s).state * 1000.0f);
+              const uint32_t recovery_hold_ms = (uint32_t)(id(zone_steering_recovery_hold_s).state * 1000.0f);
               const char *zone;
 
               if (actual > target + hard_excess) {
@@ -981,6 +986,7 @@ script:
                     zone = "FLOOR_HOLD";
                     id(zone_was_floor_holding) = true;
                   }
+                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
                 } else {
                   // Still above the floor -- controlled (SLOW-band)
                   // descent toward it, not yet holding.
@@ -997,6 +1003,7 @@ script:
                   id(zone_was_floor_holding) = false;
                   pub = twc_breaker + 1.00f;
                   zone = "DESCEND_TO_FLOOR";
+                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
                 }
               } else {
                 // Excess has shrunk back under hard_excess.
@@ -1014,7 +1021,17 @@ script:
                 } else if (actual > target + tol) {
                   pub = twc_breaker + 1.00f;   // slow-decline band
                   zone = "SLOW";
-                } else if (actual < target - tol) {
+                  id(zone_brake_until_ms) = now_ms + recovery_hold_ms;
+                } else if (actual < target - tol && now_ms >= id(zone_brake_until_ms)) {
+                  // Requested explicitly: don't let INCREASE re-engage
+                  // immediately after braking -- confirmed live that
+                  // with zone_steering_tolerance_a=0, the instant actual
+                  // dipped below target the car ramped straight back up
+                  // from a correction, defeating the point of having
+                  // braked at all. Blocked for
+                  // zone_steering_recovery_hold_s after any braking
+                  // (SLOW/DESCEND_TO_FLOOR/FLOOR_HOLD/HARD) -- falls
+                  // through to HOLD below until the cooldown expires.
                   pub = twc_breaker - 1.0f;    // increase band
                   zone = "INCREASE";
                 } else {
@@ -1273,6 +1290,27 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 6.5
+
+  # Requested explicitly: after ANY braking (SLOW/DESCEND_TO_FLOOR/
+  # FLOOR_HOLD/HARD), don't let INCREASE re-engage immediately -- return
+  # to HOLD (pub=X+0.2) first and force it for this many seconds,
+  # regardless of actual vs target. Confirmed live: with
+  # zone_steering_tolerance_a=0, the instant actual dipped below target
+  # the car ramped straight back up from a correction, defeating the
+  # point of having braked at all. See zone_brake_until_ms in
+  # recompute_ct.
+  - platform: template
+    id: zone_steering_recovery_hold_s
+    name: "Zone Steering Recovery Hold"
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 60.0
+    step: 1.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 10.0
 
   # Low-surplus grace period duration (see the grace_active block in
   # recompute_ct) -- requested explicitly to be HA-adjustable at runtime
