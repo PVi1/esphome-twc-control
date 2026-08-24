@@ -3,9 +3,13 @@
 Local control of Tesla Wall Connector Gen 3 charging current over RS485, by
 emulating a Neurio/Generac CT-clamp meter (TWC3's Home Load Management
 input), driven by real per-phase current/power data mirrored in from Home
-Assistant (originally from a Shelly Pro 3EM on the main incomer). A cloud
-integration (Tesla Fleet API, Tessie, etc.) is only needed to start/stop
-the charging session — power control itself never touches the cloud.
+Assistant (originally from a Shelly Pro 3EM on the main incomer). **No
+cloud integration at all** — session start/stop isn't driven by this
+project or any cloud API (Tesla Fleet API, Tessie, etc.); the car starts
+charging on its own the moment it's plugged in or asked to via the Tesla
+app, and stops/restarts itself in response to the current this firmware
+publishes (`reported`, see "Publication law" below) — same as it would
+against any other Home Load Management meter.
 
 **Home Assistant is a hard dependency**: real-time power control runs over
 ESPHome's native API connection to HA (both the real current/power data and
@@ -48,7 +52,10 @@ law", not a proportional availability calculation, see below for why:
    → RS485 Modbus RTU (registers 0xF4-0xFC), published SYMMETRICALLY on all 3
    → TWC3 applies the limit to the car
 
-Cloud API (Tessie/Fleet, etc.): start/stop session only, independent of power control
+Session start/stop: entirely TWC3's own doing, not this project's — begins
+   when the car is plugged in or told to charge (Tesla app or otherwise),
+   ends/restarts on its own based on `reported` (see "TWC3 reaction curve"
+   in the decision tree above)
 ```
 
 ### Publication law (why this isn't a simple availability formula)
