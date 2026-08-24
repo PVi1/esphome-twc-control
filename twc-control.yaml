@@ -386,6 +386,14 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  - id: zone_pub_committed
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: zone_pub_committed_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
 
   # --- post-correction hold state (see recompute_ct) ---
   - id: post_correction_hold_until_ms
@@ -1039,8 +1047,29 @@ script:
                   zone = "HOLD";
                 }
               }
-              ESP_LOGI("zone_steering", "target=%.2f actual=%.2f engaged=%d -> %s pub=%.2f",
-                  target, actual, id(zone_steering_engaged) ? 1 : 0, zone, pub);
+              // Minimum-dwell gate (see number.*_zone_steering_min_dwell
+              // above for the full rationale): only accept this cycle's
+              // candidate pub as a real change if it differs from the
+              // currently-committed value AND enough time has passed
+              // since that value was committed. Otherwise republish the
+              // committed value unchanged, rejecting the flip-flop.
+              // Internal state above (grace timers, floor-hold flags,
+              // brake-until) still updates every cycle based on the true
+              // instantaneous decision -- only the PUBLISHED number is
+              // held sticky here.
+              const float pub_candidate = pub;
+              const uint32_t min_dwell_ms = (uint32_t)(id(zone_steering_min_dwell_s).state * 1000.0f);
+              if (std::isnan(id(zone_pub_committed)) ||
+                  std::fabs(pub_candidate - id(zone_pub_committed)) < 0.01f ||
+                  now_ms - id(zone_pub_committed_since_ms) >= min_dwell_ms) {
+                id(zone_pub_committed) = pub_candidate;
+                id(zone_pub_committed_since_ms) = now_ms;
+              } else {
+                pub = id(zone_pub_committed);
+              }
+
+              ESP_LOGI("zone_steering", "target=%.2f actual=%.2f engaged=%d -> %s pub=%.2f (committed=%.2f)",
+                  target, actual, id(zone_steering_engaged) ? 1 : 0, zone, pub, id(zone_pub_committed));
             }
 
             pub += dither;
@@ -1311,6 +1340,32 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 10.0
+
+  # Requested explicitly: confirmed live, the published value was
+  # flapping between bands multiple times per second (target/desired_avail
+  # jittering across the hard_excess boundary, especially with the fast
+  # 10A/s up-slew combined with tight tolerance/hard_excess settings) --
+  # every dip back to HOLD/INCREASE reset whatever internal
+  # "sustained excess" timer TWC3 uses, so DESCEND_TO_FLOOR (+1.0A)
+  # never got to run long enough uninterrupted to actually trigger a
+  # reaction (confirmed: vitals_vehicle_current frozen for 55+ seconds
+  # despite pub sitting mostly at +1.0A the whole time). Minimum time a
+  # newly-chosen band must be held before a DIFFERENT band is allowed to
+  # take over -- rejects rapid flip-flopping, republishing the
+  # previously-committed value instead until the dwell time elapses. See
+  # zone_pub_committed / zone_pub_committed_since_ms in recompute_ct.
+  - platform: template
+    id: zone_steering_min_dwell_s
+    name: "Zone Steering Min Dwell"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 30.0
+    step: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 3.0
 
   # Low-surplus grace period duration (see the grace_active block in
   # recompute_ct) -- requested explicitly to be HA-adjustable at runtime
