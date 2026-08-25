@@ -959,13 +959,30 @@ script:
             // (a real recovery, not just momentarily dipping under X) --
             // handing control back to the fully natural algorithm; it
             // re-engages automatically the next time reported reaches X
-            // again. Also resets whenever the car stops charging.
-            if (!car_charging) {
+            // again. Also resets whenever the car stops charging OR
+            // grid_mode is active.
+            //
+            // Confirmed live (bug, now fixed): in GRID mode, desired_avail
+            // is deliberately pinned to twc_breaker (bias_offset=0), so
+            // o_raw = worst + 0 = worst -- it naturally approaches/reaches
+            // the breaker limit simply because the car is ramping up to
+            // its OWN full allowed current, which is the intended,
+            // healthy steady-state in GRID mode, not a deficit. That
+            // wrongly auto-engaged zone steering (target=desired_avail=
+            // breaker, actual close to it -> HOLD), freezing pub at a
+            // fixed breaker+0.2A instead of tracking worst 1:1 through the
+            // ramp -- observed live as reported dropping to a flat ~20A
+            // instead of reflecting the car's real, still-ramping current
+            // (e.g. ~0.1A at a 0.5A/phase draw against a 16A TWC limit).
+            // Zone steering's actual-vs-target comparison only makes
+            // sense against a genuine household budget (FVE mode); in
+            // GRID mode there's no such budget to protect.
+            if (!car_charging || grid_mode) {
               id(zone_steering_engaged) = false;
               id(zone_stuck_baseline_a) = NAN;
               id(zone_stuck_since_ms) = 0;
             }
-            if (id(zone_steering_mode).state && car_charging &&
+            if (id(zone_steering_mode).state && car_charging && !grid_mode &&
                 !id(zone_steering_engaged) && o_raw >= twc_breaker) {
               id(zone_steering_engaged) = true;
             }
