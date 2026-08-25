@@ -398,6 +398,15 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  # --- Requested explicitly: reset the zone-steering latch on a
+  #     GRID<->FVE mode transition (see recompute_ct) -- tracks the
+  #     previous cycle's grid_mode to detect the edge. Initialized to
+  #     match grid_mode's own default (true) so there's no spurious
+  #     reset on the very first cycle after boot. ---
+  - id: zone_last_grid_mode
+    type: bool
+    restore_value: no
+    initial_value: "true"
 
   # --- post-correction hold state (see recompute_ct) ---
   - id: post_correction_hold_until_ms
@@ -952,37 +961,36 @@ script:
             //
             // Requested explicitly: auto-activate the instant reported
             // first reaches twc_breaker_limit_a (X) -- no manual switch
-            // timing needed. Latches (zone_steering_engaged) so it stays
-            // active through normal SLOW/HOLD/INCREASE fluctuation, not
-            // re-evaluating the entry gate every cycle. Deactivates ONLY
-            // at the exact moment of releasing from an active FLOOR_HOLD
-            // (a real recovery, not just momentarily dipping under X) --
-            // handing control back to the fully natural algorithm; it
-            // re-engages automatically the next time reported reaches X
-            // again. Also resets whenever the car stops charging OR
-            // grid_mode is active.
+            // timing needed, in EITHER mode (GRID or FVE) -- symmetric.
+            // Latches (zone_steering_engaged) so it stays active through
+            // normal SLOW/HOLD/INCREASE fluctuation, not re-evaluating
+            // the entry gate every cycle. Deactivates on the exact moment
+            // of releasing from an active FLOOR_HOLD (a real recovery),
+            // when the car stops charging, and on a GRID<->FVE mode
+            // transition (see below) -- re-engaging automatically the
+            // next time reported reaches X again under the new mode.
             //
-            // Confirmed live (bug, now fixed): in GRID mode, desired_avail
-            // is deliberately pinned to twc_breaker (bias_offset=0), so
-            // o_raw = worst + 0 = worst -- it naturally approaches/reaches
-            // the breaker limit simply because the car is ramping up to
-            // its OWN full allowed current, which is the intended,
-            // healthy steady-state in GRID mode, not a deficit. That
-            // wrongly auto-engaged zone steering (target=desired_avail=
-            // breaker, actual close to it -> HOLD), freezing pub at a
-            // fixed breaker+0.2A instead of tracking worst 1:1 through the
-            // ramp -- observed live as reported dropping to a flat ~20A
-            // instead of reflecting the car's real, still-ramping current
-            // (e.g. ~0.1A at a 0.5A/phase draw against a 16A TWC limit).
-            // Zone steering's actual-vs-target comparison only makes
-            // sense against a genuine household budget (FVE mode); in
-            // GRID mode there's no such budget to protect.
-            if (!car_charging || grid_mode) {
+            // Confirmed live (bug, now fixed): switching INTO grid mode
+            // could leave a latch engaged from a preceding FVE deficit,
+            // computing pub against desired_avail=breaker (GRID mode's
+            // target) using the OLD engaged state before it had a chance
+            // to naturally settle -- observed live as reported dropping
+            // to a flat ~20A instead of reflecting the car's real, still-
+            // ramping current. Zone steering itself isn't GRID-mode-
+            // unsafe -- once actually ramped up to the breaker limit,
+            // HOLD (breaker+0.2A) is a fine steady value there too, same
+            // as in FVE -- the bug was purely stale state carried across
+            // the mode switch. Fix: force a fresh disengage on the exact
+            // grid_mode transition edge (either direction), then let the
+            // normal trigger re-evaluate from a clean slate.
+            bool grid_mode_just_changed = (grid_mode != id(zone_last_grid_mode));
+            id(zone_last_grid_mode) = grid_mode;
+            if (!car_charging || grid_mode_just_changed) {
               id(zone_steering_engaged) = false;
               id(zone_stuck_baseline_a) = NAN;
               id(zone_stuck_since_ms) = 0;
             }
-            if (id(zone_steering_mode).state && car_charging && !grid_mode &&
+            if (id(zone_steering_mode).state && car_charging &&
                 !id(zone_steering_engaged) && o_raw >= twc_breaker) {
               id(zone_steering_engaged) = true;
             }
