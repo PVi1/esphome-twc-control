@@ -1143,7 +1143,15 @@ script:
                   target, actual, id(zone_steering_engaged) ? 1 : 0, zone, pub, id(zone_pub_committed));
             }
 
-            pub += dither;
+            // Requested explicitly: confirmed live, pub could publish
+            // slightly negative (e.g. -0.1A) whenever the natural value
+            // sat at/near 0 and the dither's negative half-cycle pushed
+            // it under -- a negative reported current is physically
+            // meaningless (there's no such thing as "negative available
+            // current"). Floor AFTER dither, not before, so dither still
+            // alternates freely everywhere pub is comfortably above 0;
+            // only the rare near-zero case gets clamped.
+            pub = std::max(pub + dither, 0.0f);
 
             reported_a = reported_b = reported_c = pub;
 
