@@ -788,9 +788,32 @@ script:
 
             // Main breaker protection, applied AFTER slewing -- instant,
             // never delayed, regardless of mode.
-            float avail_main_a = main_breaker - real_a;
-            float avail_main_b = main_breaker - real_b;
-            float avail_main_c = main_breaker - real_c;
+            //
+            // Confirmed live (bug, now fixed): this used to subtract the
+            // car-INCLUSIVE real_a/b/c from main_breaker -- a
+            // self-referential quantity, since the car's own current is
+            // the very thing this clamp then goes on to limit. Created a
+            // positive-feedback oscillation, most visible in GRID mode
+            // (no solar offsetting the import, so real tracks the car's
+            // current almost 1:1): the car draws more -> real rises ->
+            // avail_main shrinks -> desired_avail drops -> bias_offset
+            // rises -> o_raw rises FASTER than 1:1 -> TWC throttles ->
+            // real drops -> avail_main recovers -> desired_avail rises
+            // again -> car ramps back up -> repeat. Observed live: real
+            // ~11.6A/phase, reported pinned at ~20.3A and the charging
+            // current visibly hunting up and down, well short of both
+            // twc_breaker (20A) and main_breaker (25A). Fixed by using
+            // the HOUSEHOLD-ONLY signal (household_a/b/c, already
+            // computed above via TWC3's own vitals API -- same source
+            // FVE's desired_avail already uses) instead -- headroom for
+            // the car is then a function of everything ELSE on that
+            // phase, independent of how much the car itself is drawing,
+            // eliminating the feedback loop entirely. fabsf because a
+            // breaker trips on current magnitude regardless of direction
+            // (import or export).
+            float avail_main_a = main_breaker - fabsf(household_a);
+            float avail_main_b = main_breaker - fabsf(household_b);
+            float avail_main_c = main_breaker - fabsf(household_c);
             float avail_main_min = std::min(std::min(avail_main_a, avail_main_b), avail_main_c);
             desired_avail = std::min(desired_avail, avail_main_min);
 
