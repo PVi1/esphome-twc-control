@@ -349,11 +349,30 @@ flowchart TD
     class L,M hold
 ```
 
-**Auto-engage / latch**: engages the instant the classic computation
-would have published `>= twc_breaker_limit_a` while charging — not
-tied to a manual switch or timing. Stays engaged through normal
-fluctuation; disengages only on `FLOOR_REACHED` handoff or
-`!car_charging`; re-engages fresh on the next threshold hit.
+**Auto-engage / latch**: engages once the classic computation has been
+publishing `>= twc_breaker_limit_a` **continuously for
+`zone_steering_engage_delay_s` (default 30s)** while charging — not
+tied to a manual switch. Stays engaged through normal fluctuation;
+disengages only on `FLOOR_REACHED` handoff, `!car_charging`, a
+GRID↔FVE transition, or `switch.*_zone_steering_mode` being turned
+off (an active latch drops immediately, not at the next
+`!car_charging`); re-engages fresh on the next sustained threshold
+hit.
+
+**Why the delay**: a 3-phase Tesla session doesn't engage all 3
+phases at once — it pours its whole draw onto L1 for the first
+several seconds, ramping toward target, before L2/L3 pick up. During
+that window `worst` (one heavily-loaded phase) measured against a
+per-phase `desired_avail` budget makes `o_raw` transiently shoot past
+the limit even though nothing is wrong (vitals' 2s poll lag —
+`twc_vitals_current_b/c` still ~0 — makes it worse). Live-confirmed:
+the old single-cycle entry gate latched on that spike and immediately
+braked (SLOW → DESCEND_TO_FLOOR → 60s stuck-timeout to +1.1A →
+cascade), aborting the session *before the other phases ever
+connected*. The classic law rides the same window out safely
+(slew-limited `desired_avail`, compressed/capped excess, 120s
+escalation), so the debounce simply defers handover until it's a real
+sustained deficit.
 
 **Floor + immediate handoff**: the original design had a separate
 FLOOR_HOLD state with its own grace timer. Live-confirmed: `actual`
@@ -408,6 +427,7 @@ an immediate ramp back up, undoing the correction just made.
 | `zone_steering_recovery_hold_s` | 10 s | blocks INCREASE right after braking |
 | `zone_steering_min_dwell_s` | 3 s | minimum time between pub escalations (asymmetric) |
 | `zone_steering_stuck_timeout_s` | 60 s (5-900) | escalates to +1.1A when no progress is made |
+| `zone_steering_engage_delay_s` | 30 s (0-180) | `o_raw` must sit over the limit this long before the latch engages — rides out multi-phase engagement |
 
 ## 10. Constants reference
 

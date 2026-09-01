@@ -398,6 +398,15 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  # --- Sustained-over-limit debounce on the zone-steering ENTRY latch
+  #     (see recompute_ct). 0 = o_raw not currently over the limit;
+  #     otherwise the millis() timestamp when it first went over. The
+  #     latch only engages once this has held continuously for
+  #     number.*_zone_steering_engage_delay. ---
+  - id: zone_over_limit_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
   # --- Requested explicitly: reset the zone-steering latch on a
   #     GRID<->FVE mode transition (see recompute_ct) -- tracks the
   #     previous cycle's grid_mode to detect the edge. Initialized to
@@ -1008,13 +1017,50 @@ script:
             // normal trigger re-evaluate from a clean slate.
             bool grid_mode_just_changed = (grid_mode != id(zone_last_grid_mode));
             id(zone_last_grid_mode) = grid_mode;
-            if (!car_charging || grid_mode_just_changed) {
+            // Also drop an active latch the instant switch.*_zone_steering_mode
+            // is turned OFF -- otherwise disabling the feature mid-session
+            // left the steering block (which only checks zone_steering_engaged,
+            // not the switch) fully in control until the next !car_charging.
+            if (!car_charging || grid_mode_just_changed || !id(zone_steering_mode).state) {
               id(zone_steering_engaged) = false;
               id(zone_stuck_baseline_a) = NAN;
               id(zone_stuck_since_ms) = 0;
             }
+            // Sustained-over-limit debounce on the ENTRY latch.
+            // Confirmed live (bug, now fixed): a 3-phase Tesla session
+            // doesn't engage all 3 phases at once -- it pours its whole
+            // draw onto L1 for the first several seconds, ramping toward
+            // target, before L2/L3 pick up. During that window "worst"
+            // (one heavily-loaded phase) measured against a PER-PHASE
+            // desired_avail budget makes o_raw transiently shoot well
+            // past the limit even though nothing is actually wrong, and
+            // vitals' 2s poll lag (twc_vitals_current_b/c still ~0)
+            // makes it worse. The old single-cycle "o_raw >= twc_breaker"
+            // gate latched zone steering on that spike and immediately
+            // braked (SLOW -> DESCEND_TO_FLOOR -> 60s stuck-timeout to
+            // +1.1A -> cascade), aborting the session BEFORE the other
+            // phases ever connected. The classic law rides this same
+            // window out safely (slew-limited desired_avail, compressed
+            // /capped excess, 120s escalation) -- so require o_raw to
+            // sit over the limit CONTINUOUSLY for
+            // number.*_zone_steering_engage_delay while charging before
+            // handing over. Matches the design's own stated intent
+            // ("only engages when the classic law would already be
+            // publishing at/above the limit while charging") better
+            // than a one-cycle poke did.
+            if (id(zone_steering_mode).state && car_charging && o_raw >= twc_breaker) {
+              if (id(zone_over_limit_since_ms) == 0) id(zone_over_limit_since_ms) = now_ms;
+            } else {
+              // Held at 0 while the switch is off too -- re-enabling it
+              // starts a fresh engage-delay count, not an instant latch.
+              id(zone_over_limit_since_ms) = 0;
+            }
+            const uint32_t zone_engage_delay_ms =
+                (uint32_t)(id(zone_steering_engage_delay_s).state * 1000.0f);
+            bool zone_over_limit_sustained = id(zone_over_limit_since_ms) != 0 &&
+                (now_ms - id(zone_over_limit_since_ms)) >= zone_engage_delay_ms;
             if (id(zone_steering_mode).state && car_charging &&
-                !id(zone_steering_engaged) && o_raw >= twc_breaker) {
+                !id(zone_steering_engaged) && zone_over_limit_sustained) {
               id(zone_steering_engaged) = true;
             }
 
@@ -1527,6 +1573,28 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 3.0
+
+  # Sustained-over-limit debounce before the zone-steering entry latch
+  # engages (see the entry gate in recompute_ct). Confirmed live: a
+  # 3-phase session pours its whole draw onto L1 for the first several
+  # seconds before L2/L3 engage, transiently spiking o_raw past the
+  # limit (one loaded phase vs a per-phase budget, plus vitals' 2s
+  # poll lag) -- latching on that single-cycle spike braked/aborted
+  # the session before the other phases connected. o_raw must now sit
+  # over the limit continuously for this long while charging before
+  # zone steering takes over; the classic law covers that window.
+  - platform: template
+    id: zone_steering_engage_delay_s
+    name: "Zone Steering Engage Delay"
+    icon: "mdi:timer-cog-outline"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 180.0
+    step: 1.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 30.0
 
   # Low-surplus grace period duration (see the grace_active block in
   # recompute_ct) -- requested explicitly to be HA-adjustable at runtime

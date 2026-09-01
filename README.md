@@ -253,9 +253,18 @@ with everything observed so far, and part of why zone steering can safely
 hold a fixed band value for multiple seconds without a correlation-distrust
 stop the way a static value would during ramp-up.
 
-**Auto-engage / handoff (latch)**: engages the instant the classic
-computation would publish `>= twc_breaker_limit_a` while charging, and
-stays engaged through normal fluctuation. The moment `actual` reaches
+**Auto-engage / handoff (latch)**: engages once the classic
+computation has been publishing `>= twc_breaker_limit_a` **continuously
+for `number.*_zone_steering_engage_delay_s` (default 30s)** while
+charging, and stays engaged through normal fluctuation. The delay
+rides out the initial multi-phase engagement window: a 3-phase Tesla
+session pours its whole draw onto L1 for the first several seconds
+before L2/L3 pick up, which — measured against a per-phase
+`desired_avail` budget, plus the vitals API's 2s poll lag — transiently
+pushes `o_raw` past the limit even though nothing is wrong. Confirmed
+live that latching on that single-cycle spike braked and aborted the
+session before the other phases ever connected; the classic law
+handles that window safely on its own. The moment `actual` reaches
 `number.*_zone_steering_floor_a` inside the HARD band, it disengages
 immediately and hands control back to the classic algorithm's own
 grace-period mechanism (rather than maintaining a separate floor-hold
@@ -263,7 +272,9 @@ state with its own timer) — confirmed live that holding a separate
 floor-hold state let `actual` stabilize just above the floor (a real,
 small, sustained deficit) for 8+ minutes without ever escalating or
 handing off, and TWC3 eventually aborted anyway. Disengages fully on
-`!car_charging`, re-engaging fresh on the next threshold hit.
+`!car_charging` or when `switch.*_zone_steering_mode` is turned off
+(an active latch drops right away, not only at the next
+`!car_charging`), re-engaging fresh on the next threshold hit.
 
 **Stuck-timeout escalation** (`number.*_zone_steering_stuck_timeout_s`,
 default 60s, 5-900s range): if `actual` shows no real progress (no
@@ -302,7 +313,9 @@ the HARD band, distinct from the fixed +1.1A HARD excess value itself),
 off), `number.*_zone_steering_low_current_threshold_a` (8.0A default)
 and `number.*_zone_steering_slow_brake_excess_a` (0.9A default — the
 gentler SLOW excess used below that threshold), `number.*_zone_steering_recovery_hold_s`,
-`number.*_zone_steering_min_dwell_s`, `number.*_zone_steering_stuck_timeout_s`.
+`number.*_zone_steering_min_dwell_s`, `number.*_zone_steering_stuck_timeout_s`,
+`number.*_zone_steering_engage_delay_s` (30s default, 0-180s — sustained
+over-limit time required before the latch engages).
 
 **Design history — earlier algorithm generations, kept for context.** The
 generations below all predate the discovery that TWC3 FW 26.26.1 doesn't
