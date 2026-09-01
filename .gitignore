@@ -3,7 +3,5 @@
 /secrets.yaml
 venv/
 
-# Local log/data captures and editor lock files, not part of the project
-/data.csv
-/data.log
+# Editor lock files, not part of the project
 .~lock.*#
