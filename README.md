@@ -117,16 +117,64 @@ source).
   (physically impossible for a real ramp).
 - **Dither** (`dither_amplitude_a`, ±0.05A alternating at 1Hz, always on
   including fail-safe) — `reported` is never perfectly static for long.
-- **Symmetric publication**: the final value is published identically on
-  all 3 Modbus registers — TWC3's own service loop expects
-  `min == mean == max` to correctly engage at the true constraint,
-  regardless of which phase is actually weakest.
+- **Symmetric publication — with one deliberate exception**: the final
+  value is normally published identically on all 3 Modbus registers —
+  TWC3's own service loop expects `min == mean == max` to correctly
+  engage at the true constraint, regardless of which phase is actually
+  weakest. The exception is the multi-phase engagement window, see
+  below.
+- **Multi-phase engagement — per-phase asymmetric publishing**: a
+  3-phase Tesla session doesn't engage all 3 phases at once — it pours
+  its whole draw onto L1 for several seconds before L2/L3 pick up
+  (vitals' 2s poll lag makes it worse). Confirmed live (bug, now
+  fixed): the symmetric law stamped the same `worst+bias_offset` onto
+  all 3 registers, so with only L1 drawing and a low FVE budget, L2/L3
+  read as saturated too even though they carried nothing — TWC3 then
+  wouldn't bring them up, held the car at its ~6A minimum on L1 alone,
+  and the session aborted within ~3s every attempt (GRID mode, with
+  `bias_offset=0`, engaged all 3 phases and ramped fine in the same
+  conditions — the tell). Fix: while charging and not all 3 phases are
+  carrying current yet (and the over-limit hasn't held long enough to
+  be a confirmed sustained deficit — see `zone_steering_engage_delay_s`
+  below), each phase publishes its own value —
+  `reported_x = clamp(corr_x + bias_offset, 0, twc_breaker)` — instead
+  of the shared symmetric `pub`. A loaded phase parks at the budget
+  ("hold"); an idle phase (still net-exporting) reads well under the
+  limit ("connect and ramp"). As each phase joins, its value converges
+  upward; once all 3 are carrying current, the symmetric law resumes
+  with everything already near the budget.
+- **Near-limit handoff, once fully ramped**: once all 3 phases are
+  established, a marginal over-limit (car sitting essentially at its
+  own target) hands off to zone steering's actual-vs-target tolerance
+  *immediately* rather than the classic law's `law_nudge_min_a` floor —
+  see "Zone steering" below for why. If zone steering is off or hasn't
+  engaged and the car is within 2A of its own practical minimum, an
+  unconfirmed over-limit instead publishes a gentle `breaker+0.3A`
+  (TWC3's no-reaction band) — it can't throttle down any further
+  without dropping out, so a brief dip is ridden out instead of forced
+  into a stop.
+- **Budget floored to a whole amp**: `desired_avail` is `floorf()`-ed
+  before it feeds `bias_offset`/`o_raw`/`pub` (and the zone-steering
+  target). Confirmed live: a fractional budget (e.g. `8.33A`) still let
+  the app/TWC3 present a rounded-*up* whole-amp max to the driver, who
+  then actually drew more than the true budget once the household load
+  was added back in. `floorf()` only ever makes the published budget
+  more conservative — same never-overshoot-reality principle already
+  used for `signed_x` on the export side, above.
 - **Escalation** (secondary safety net, 2-stage step per the reference
   project, not a continuous ramp): if `o_raw` stays above the limit
   continuously for `escalation_timeout_ms` (default 120s), force `reported`
   to at least `law_nudge_min_a` past the limit; if it's *still* there after
   `2×escalation_timeout_ms`, force it to `escalation_kick_a` (default
-  1.5A) — safely past the confirmed reaction margin.
+  1.5A) — safely past the confirmed reaction margin. Suppressed during
+  the multi-phase engagement window above — forcing all 3 registers up
+  would defeat the per-phase headroom signal.
+- **Post-correction hold clears on contactor-open**: the 60s
+  anti-oscillation hold (below) used to keep `reported` pinned at
+  `twc_breaker` for up to a minute after a session had *already ended*.
+  It now clears the instant `twc_vitals_contactor_closed` goes false —
+  there's nothing left to hold back once the charging circuit itself
+  is open.
 
 Both breakers (`twc_breaker_limit_a` and `main_breaker_limit_a`) still
 clamp `desired_avail` before any of the above — main-breaker protection is
@@ -181,6 +229,16 @@ others export a lot more) is overly conservative — the
 `desired_avail` from the weakest phase to the **average** of the
 household-only signal across all 3 phases instead.
 
+**Caveat, confirmed live**: averaging masks a single badly-imbalanced
+phase. A ~2.2kW single-phase load (a water heater) sitting almost
+entirely on one leg still let AGG mode compute a comfortable-looking
+`desired_avail` — but `worst` (the correlation term, never touched by
+`fve_offset` or by AGG's averaging) picks up that same loaded phase's
+*raw* current directly, so `o_raw` stayed persistently over the limit
+the whole time regardless of what the averaged budget promised. If
+this happens often, per-phase billing doesn't have the blind spot (the
+tight phase *is* the budget, via `min`).
+
 Either way, the per-phase main-breaker safety check
 (`main_breaker_limit_a - real`) still applies unconditionally, after
 slewing, so it's never delayed.
@@ -228,8 +286,21 @@ discrete bands, chosen by comparing the vehicle's own **actual** current
 (`twc_vitals_vehicle_current`) against `desired_avail` (the target):
 
 - **INCREASE** (`actual < target - tolerance`, and past a post-brake
-  recovery cooldown): publish `twc_breaker_limit_a - 1.0A`, i.e. let the
-  classic law's own below-limit tracking take back over.
+  recovery cooldown): **hands off to the classic law entirely**
+  (`engaged=false`) instead of publishing a flat value. Confirmed live
+  (bug, now fixed): this used to publish a static `twc_breaker_limit_a
+  - 1.0A` — held flat for 15-20+ seconds while the car's own current
+  was genuinely fluctuating (several ramp-up attempts), which is
+  exactly the static-value distrust-latch risk this file's own dither
+  mechanism exists to avoid, and a session dropped out with `reported`
+  sitting comfortably under the limit the whole time (nothing in the
+  published signal explained the stop). `actual` clearly below
+  `target` means `worst` is below `desired_avail` too, so `o_raw` is
+  provably under the limit here — safe to hand back to the natural,
+  worst-tracking computation instead of a static number. HOLD (below)
+  stays zone-steering-owned regardless — disengaging there would
+  reintroduce the exact knife-edge cascade the immediate ramp-complete
+  handoff (below) fixes.
 - **HOLD** (small deadband around target): publish
   `twc_breaker_limit_a + 0.2A` — inside TWC3's ignored range, no
   reaction, but keeps `reported` moving (correlation-safe) without
@@ -253,18 +324,25 @@ with everything observed so far, and part of why zone steering can safely
 hold a fixed band value for multiple seconds without a correlation-distrust
 stop the way a static value would during ramp-up.
 
-**Auto-engage / handoff (latch)**: engages once the classic
+**Auto-engage / handoff (latch)**: engages either once the classic
 computation has been publishing `>= twc_breaker_limit_a` **continuously
 for `number.*_zone_steering_engage_delay_s` (default 30s)** while
-charging, and stays engaged through normal fluctuation. The delay
-rides out the initial multi-phase engagement window: a 3-phase Tesla
-session pours its whole draw onto L1 for the first several seconds
-before L2/L3 pick up, which — measured against a per-phase
-`desired_avail` budget, plus the vitals API's 2s poll lag — transiently
-pushes `o_raw` past the limit even though nothing is wrong. Confirmed
-live that latching on that single-cycle spike braked and aborted the
-session before the other phases ever connected; the classic law
-handles that window safely on its own. The moment `actual` reaches
+charging, **or immediately** once all 3 phases are established
+(`ramp_complete`) and `o_raw` is over the limit at all, and stays
+engaged through normal fluctuation. The 30s delay path rides out the
+initial multi-phase engagement window — handled separately by
+per-phase publishing now (see "Multi-phase engagement" above), so this
+path mainly covers a genuine sustained deficit independent of
+engagement. The immediate ramp-complete path exists because a marginal
+overshoot right as the car finishes ramping (`actual` essentially at
+`target`) used to hit the classic law's `law_nudge_min_a` floor and
+cascade — confirmed live: a fully-ramped session (~9.9A/phase) had
+`o_raw` tick over the limit by ~0.2-0.7A, well within zone steering's
+own HOLD tolerance, but the classic law slammed straight to
+`breaker+1.1A` and the session dropped out even though `o_raw`
+recovered under the limit less than a second later (a cascade, once
+triggered, doesn't reliably stop on its own — see the reaction curve
+above). The moment `actual` reaches
 `number.*_zone_steering_floor_a` inside the HARD band, it disengages
 immediately and hands control back to the classic algorithm's own
 grace-period mechanism (rather than maintaining a separate floor-hold
@@ -315,7 +393,8 @@ and `number.*_zone_steering_slow_brake_excess_a` (0.9A default — the
 gentler SLOW excess used below that threshold), `number.*_zone_steering_recovery_hold_s`,
 `number.*_zone_steering_min_dwell_s`, `number.*_zone_steering_stuck_timeout_s`,
 `number.*_zone_steering_engage_delay_s` (30s default, 0-180s — sustained
-over-limit time required before the latch engages).
+over-limit time required before the *delayed* latch path engages; the
+ramp-complete path is immediate, see "Auto-engage / handoff" above).
 
 **Design history — earlier algorithm generations, kept for context.** The
 generations below all predate the discovery that TWC3 FW 26.26.1 doesn't
