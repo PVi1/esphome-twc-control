@@ -398,6 +398,15 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+  # --- Sustained-over-limit debounce on the zone-steering ENTRY latch
+  #     (see recompute_ct). 0 = o_raw not currently over the limit;
+  #     otherwise the millis() timestamp when it first went over. The
+  #     latch only engages once this has held continuously for
+  #     number.*_zone_steering_engage_delay. ---
+  - id: zone_over_limit_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
   # --- Requested explicitly: reset the zone-steering latch on a
   #     GRID<->FVE mode transition (see recompute_ct) -- tracks the
   #     previous cycle's grid_mode to detect the edge. Initialized to
@@ -817,6 +826,23 @@ script:
             float avail_main_min = std::min(std::min(avail_main_a, avail_main_b), avail_main_c);
             desired_avail = std::min(desired_avail, avail_main_min);
 
+            // Requested explicitly: floor the budget down to a whole
+            // amp before it feeds bias_offset/o_raw/pub. Confirmed live:
+            // a fractional desired_avail (e.g. 8.33A, from
+            // fve_offset=6kW minus a ~250W household baseline) still let
+            // TWC3/the app present a rounded-up whole-amp max (9A) to
+            // the car -- the car then actually draws 9A x 3 x 230V =
+            // 6210W, already 210W over the 6kW offset alone, before
+            // even adding the household's own 250W back in (460W total
+            // overshoot). floorf() only ever makes the published budget
+            // MORE conservative (rounds toward less availability,
+            // including for negative/deficit values) -- the same
+            // never-overshoot-reality principle already used for
+            // signed_x on the export side (see above) and the R1 hard
+            // floor, just applied to the budget itself instead of the
+            // real-time correlation signal.
+            desired_avail = floorf(desired_avail);
+
             // Publication law -- see the comment block above script: for
             // the full design (adapted from
             // https://github.com/zany92/tesla-loadpilot). worst-phase,
@@ -895,8 +921,66 @@ script:
               id(low_surplus_since_ms) = 0;
             }
 
+            // "Over the limit" is not treated as a real correction until
+            // it has been SUSTAINED. Confirmed live (bug, now fixed):
+            // during the initial multi-phase engagement the car pours
+            // its whole draw onto one phase for ~1-3s before the others
+            // pick up -- "worst" (that one loaded phase) against a
+            // per-phase/aggregate desired_avail budget, plus the vitals
+            // API's 2s poll lag, transiently pushes o_raw past the limit
+            // even though the surplus is really there (desired_avail
+            // fast-recovers the moment vitals catches up). The classic
+            // law's law_nudge_min_a floor then slammed pub straight to
+            // breaker+1.1A -- the confirmed fast-cascade band (see the
+            // reaction-curve notes / docs) -- and TWC3 aborted the
+            // session before the other phases ever connected. Live trace:
+            // worst 5.9A single-phase, desired_avail dipping 5.9->4.7,
+            // o_raw 21.2, pub pinned 21.1 for ~2.5s, contactor opened.
+            // So: while o_raw has been over the limit for LESS than
+            // number.*_zone_steering_engage_delay, treat it as an
+            // unconfirmed transient -- gentle (TWC3-ignored-band) excess
+            // only, no post-correction hold armed, no zone-steering
+            // handover. Only once it has held that long is it a real
+            // deficit and the full law_nudge_min_a floor / hold /
+            // zone steering apply. Timer runs regardless of the
+            // zone_steering_mode switch -- this transient filter is part
+            // of the classic law too.
+            if (car_charging && o_raw > twc_breaker) {
+              if (id(zone_over_limit_since_ms) == 0) id(zone_over_limit_since_ms) = now_ms;
+            } else {
+              id(zone_over_limit_since_ms) = 0;
+            }
+            const uint32_t over_limit_confirm_ms =
+                (uint32_t)(id(zone_steering_engage_delay_s).state * 1000.0f);
+            const bool over_limit_confirmed = id(zone_over_limit_since_ms) != 0 &&
+                (now_ms - id(zone_over_limit_since_ms)) >= over_limit_confirm_ms;
+
+            // All 3 phases actually carrying current = the multi-phase
+            // ramp has completed and the per-phase/aggregate budget
+            // maths (and the symmetric publication law) is meaningful
+            // again. Vitals poll is 2s, so this can lag the real
+            // engagement by a cycle -- fine.
+            const bool ramp_complete = car_charging &&
+                id(twc_vitals_current_a) >= 2.0f &&
+                id(twc_vitals_current_b) >= 2.0f &&
+                id(twc_vitals_current_c) >= 2.0f;
+            // Multi-phase engagement window: charging, not all 3 phases
+            // carrying yet, and the over-limit hasn't held long enough
+            // to be a real sustained deficit. reported is published
+            // PER-PHASE and asymmetric here (the one exception to the
+            // otherwise-symmetric law, see below) -- pub in this branch
+            // is only a sane internal/diagnostic placeholder.
+            const bool startup_bringup =
+                car_charging && !ramp_complete && !over_limit_confirmed;
+            // Car fully on 3 phases but sitting at ~its own minimum
+            // (can't throttle any lower without dropping out).
+            const bool near_min = car_charging && ramp_complete &&
+                id(twc_vitals_vehicle_current) <= (float)${min_charge_current_a} + 2.0f;
+
             float pub;
-            if (o_raw <= twc_breaker) {
+            if (startup_bringup) {
+              pub = std::min(std::max(worst + bias_offset, 0.0f), twc_breaker);
+            } else if (o_raw <= twc_breaker) {
               // Floor at 0: during strong export, worst (a phase's own
               // real current, negative while exporting) plus bias_offset
               // can go negative -- confirmed live (~5975W export -> pub
@@ -906,6 +990,21 @@ script:
               // negative adds no information, only untested territory for
               // TWC3's own correlation check.
               pub = std::max(o_raw, 0.0f);
+            } else if (near_min && !over_limit_confirmed) {
+              // All 3 phases up but the car is at ~its minimum and
+              // o_raw is only marginally/briefly over the limit -- not
+              // a confirmed sustained deficit. It CANNOT throttle lower
+              // without dropping out. Confirmed live: the instant o_raw
+              // tipped 20.00 -> 20.05 the law_nudge_min_a floor slammed
+              // pub to breaker+1.1A (fast-cascade band); the car backed
+              // 7A -> 5A and then quit -- even though desired_avail
+              // recovered to ~10A a second later (a passing cloud).
+              // Hold pub in TWC3's no-reaction band and let the car
+              // trickle at minimum until the surplus recovers or the
+              // over-limit has held long enough (over_limit_confirmed,
+              // 30s) to justify actually stopping it via the normal law
+              // / zone steering.
+              pub = twc_breaker + 0.3f;
             } else {
               float excess = std::min(((float)${excess_gain}) * (o_raw - twc_breaker), (float)${excess_max_a});
               excess = std::max(excess, (float)${law_nudge_min_a});
@@ -946,7 +1045,26 @@ script:
             // above is what actually prevents oscillation/contactor
             // cycling; a further rate limit on top of it only cost
             // unused surplus, it didn't add any additional safety.
-            if (o_raw > twc_breaker) {
+            // Requested explicitly: once the session actually ends
+            // (contactor open -- no charging circuit left to oscillate),
+            // drop the hold immediately instead of pinning reported at
+            // twc_breaker for the rest of the 60s window. The hold only
+            // exists to stop the car re-ramping and cycling the
+            // contactor; with the contactor already open there's nothing
+            // to hold against, and a stale pin at 20A just sits there
+            // (confirmed live: reported stuck at 20A for up to a minute
+            // after a session ended) and can only get in the way of the
+            // next start attempt.
+            if (!id(twc_vitals_contactor_closed)) {
+              id(post_correction_hold_until_ms) = 0;
+              id(hold_bias_offset) = 0.0f;
+            }
+            // Only a CONFIRMED over-limit (see over_limit_confirmed
+            // above) arms the hold -- a 1-3s engagement-window artifact
+            // never pushed pub past breaker+0.4A, so there's nothing to
+            // hold back from, and arming a 60s hold over it just pinned
+            // reported at 20A for a minute afterward (confirmed live).
+            if (o_raw > twc_breaker && over_limit_confirmed) {
               id(post_correction_hold_until_ms) = now_ms + (uint32_t)${post_correction_hold_ms};
               id(hold_bias_offset) = bias_offset;
             } else if (now_ms < id(post_correction_hold_until_ms)) {
@@ -1008,13 +1126,46 @@ script:
             // normal trigger re-evaluate from a clean slate.
             bool grid_mode_just_changed = (grid_mode != id(zone_last_grid_mode));
             id(zone_last_grid_mode) = grid_mode;
-            if (!car_charging || grid_mode_just_changed) {
+            // Also drop an active latch the instant switch.*_zone_steering_mode
+            // is turned OFF -- otherwise disabling the feature mid-session
+            // left the steering block (which only checks zone_steering_engaged,
+            // not the switch) fully in control until the next !car_charging.
+            if (!car_charging || grid_mode_just_changed || !id(zone_steering_mode).state) {
               id(zone_steering_engaged) = false;
               id(zone_stuck_baseline_a) = NAN;
               id(zone_stuck_since_ms) = 0;
             }
+            // Entry latch. Two ways in:
+            //  1) over_limit_confirmed -- the classic law has been
+            //     publishing over the limit continuously for
+            //     number.*_zone_steering_engage_delay while charging
+            //     (the old single-cycle "o_raw >= twc_breaker" gate
+            //     latched on the multi-phase engagement transient and
+            //     immediately braked, aborting the session before the
+            //     other phases connected -- confirmed live).
+            //  2) ramp_complete AND o_raw over the limit -- once all 3
+            //     phases are genuinely established, hand off to zone
+            //     steering's graduated actual-vs-target bands
+            //     IMMEDIATELY rather than the classic law's single-step
+            //     law_nudge_min_a floor. Confirmed live (bug, now
+            //     fixed): a fully-ramped 3-phase session (~9.9A/phase,
+            //     nowhere near the car's minimum) had o_raw tick over
+            //     the limit by a trivial ~0.2-0.7A -- actual(9.9) was
+            //     essentially AT target(10.1), well within zone
+            //     steering's own tolerance (HOLD band, +0.2A) -- but the
+            //     classic law's law_nudge_min_a floor doesn't grade by
+            //     how large the excess actually is, so it slammed pub
+            //     straight to breaker+1.1A (confirmed-fast-cascade per
+            //     the reaction curve). o_raw recovered under the limit
+            //     less than a second later (the car had already backed
+            //     off on its own) but the cascade was already committed
+            //     -- session dropped out anyway, matching the
+            //     documented "recovery doesn't stop an in-progress
+            //     cascade" finding. Zone steering's tolerance/HOLD band
+            //     would have ridden this out gently instead.
             if (id(zone_steering_mode).state && car_charging &&
-                !id(zone_steering_engaged) && o_raw >= twc_breaker) {
+                !id(zone_steering_engaged) &&
+                (over_limit_confirmed || (ramp_complete && o_raw > twc_breaker))) {
               id(zone_steering_engaged) = true;
             }
 
@@ -1113,8 +1264,39 @@ script:
                   // zone_steering_recovery_hold_s after any braking
                   // (SLOW/DESCEND_TO_FLOOR/FLOOR_HOLD/HARD) -- falls
                   // through to HOLD below until the cooldown expires.
-                  pub = twc_breaker - 1.0f;    // increase band
-                  zone = "INCREASE";
+                  //
+                  // Requested explicitly (bug, now fixed): this used to
+                  // publish a flat breaker-1.0A "increase" signal --
+                  // confirmed live, held static (only dither-sized
+                  // wiggle) for 15-20+ seconds while the car's own
+                  // actual current was genuinely fluctuating (trying
+                  // several ramp-up attempts), and the session then
+                  // dropped out with pub sitting comfortably under the
+                  // limit the whole time (no excess, no escalation --
+                  // nothing in OUR signal explains the stop). A static
+                  // reported value during a live ramp is exactly the
+                  // distrust-latch risk this file's own dither mechanism
+                  // and the R1/worst-tracking design exist to avoid
+                  // elsewhere (see the publication-law comment block) --
+                  // zone steering's flat bands were only ever meant to
+                  // cover the BRAKING side of this, not to also stand in
+                  // for the natural, correlation-safe worst-tracking
+                  // value while there's room to grow. actual clearly
+                  // below target (by more than tol) means worst is below
+                  // desired_avail by more than tol too, so o_raw =
+                  // worst+bias_offset is safely under twc_breaker here --
+                  // hand off to the natural computation instead of
+                  // holding a static number, and only re-engage zone
+                  // steering if a real braking need reappears (entry
+                  // latch above).
+                  id(zone_floor_hold_since_ms) = 0;
+                  id(zone_steering_engaged) = false;
+                  id(zone_stuck_baseline_a) = NAN;
+                  id(zone_stuck_since_ms) = 0;
+                  is_handoff = true;
+                  zone = "INCREASE(handoff to natural)";
+                  // pub left as whatever the natural computation above
+                  // already produced -- not overridden here.
                 } else {
                   pub = twc_breaker + 0.20f;   // hold band
                   zone = "HOLD";
@@ -1176,7 +1358,34 @@ script:
             // only the rare near-zero case gets clamped.
             pub = std::max(pub + dither, 0.0f);
 
-            reported_a = reported_b = reported_c = pub;
+            if (startup_bringup) {
+              // PER-PHASE, ASYMMETRIC -- the deliberate exception to the
+              // symmetric law, only during multi-phase engagement.
+              // Confirmed live: the symmetric law stamps the same
+              // worst+bias_offset onto all 3 registers, so with only L1
+              // drawing and a low FVE desired_avail (~6A -> bias_offset
+              // ~14A) reported saturated at ~20A on the idle L2/L3 too.
+              // TWC3 saw no per-phase headroom there and would not bring
+              // L2/L3 up; the earlier "flat headroom on all 3" fix let
+              // them connect but also let L1 over-ramp to ~12A, so the
+              // moment L3 finally joined the correction back to the ~6A
+              // budget cascaded the session to a stop. Instead: each
+              // phase gets its OWN value. A loaded phase sits at
+              // corr_x+bias_offset clamped to twc_breaker -- TWC3's
+              // "hold, don't ramp further" band, so L1 parks near the
+              // budget instead of climbing. A not-yet-connected phase
+              // (corr_x still negative from export) reads well below the
+              // limit -- real headroom, so TWC3 connects and ramps it.
+              // As each phase joins, its corr_x rises and its reported
+              // converges up toward the same value; once all 3 carry
+              // current, ramp_complete flips and the symmetric law
+              // resumes with everything already sitting at the budget.
+              reported_a = std::min(std::max(corr_a + bias_offset, 0.0f), twc_breaker) + dither;
+              reported_b = std::min(std::max(corr_b + bias_offset, 0.0f), twc_breaker) + dither;
+              reported_c = std::min(std::max(corr_c + bias_offset, 0.0f), twc_breaker) + dither;
+            } else {
+              reported_a = reported_b = reported_c = pub;
+            }
 
             // DIAGNOSTIC: single-line CSV summary of every decisive value
             // each recompute cycle, for live monitoring via `esphome logs`
@@ -1236,7 +1445,11 @@ script:
               // test/zone-steering branch only) -- the 4-band steering
               // logic (including its own floor-hold grace) already fully
               // owns pub in that state.
-              if (!grace_active && !id(zone_steering_engaged)) {
+              // Also suppressed during startup_bringup -- the per-phase
+              // asymmetric publishing above is deliberately holding the
+              // loaded phase at the budget while the others connect;
+              // forcing all 3 registers up would defeat exactly that.
+              if (!grace_active && !id(zone_steering_engaged) && !startup_bringup) {
                 if (capped_for >= (uint32_t)${escalation_timeout_ms}) {
                   reported_a = reported_b = reported_c = std::max(pub, twc_breaker + (float)${law_nudge_min_a});
                   if (!id(escalation_stage1_logged)) {
@@ -1527,6 +1740,28 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 3.0
+
+  # Sustained-over-limit debounce before the zone-steering entry latch
+  # engages (see the entry gate in recompute_ct). Confirmed live: a
+  # 3-phase session pours its whole draw onto L1 for the first several
+  # seconds before L2/L3 engage, transiently spiking o_raw past the
+  # limit (one loaded phase vs a per-phase budget, plus vitals' 2s
+  # poll lag) -- latching on that single-cycle spike braked/aborted
+  # the session before the other phases connected. o_raw must now sit
+  # over the limit continuously for this long while charging before
+  # zone steering takes over; the classic law covers that window.
+  - platform: template
+    id: zone_steering_engage_delay_s
+    name: "Zone Steering Engage Delay"
+    icon: "mdi:timer-cog-outline"
+    unit_of_measurement: "s"
+    min_value: 0.0
+    max_value: 180.0
+    step: 1.0
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 30.0
 
   # Low-surplus grace period duration (see the grace_active block in
   # recompute_ct) -- requested explicitly to be HA-adjustable at runtime

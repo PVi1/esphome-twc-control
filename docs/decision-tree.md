@@ -27,25 +27,31 @@ flowchart TD
     MODE -- "false = FVE" --> AGGCHECK{"aggregate_balance_metering?"}
     AGGCHECK -- "ON" --> AGGAVAIL["desired_avail =<br/>average(-household_x + offset)"]
     AGGCHECK -- "OFF" --> PERPHASEAVAIL["desired_avail =<br/>min(-household_x + offset)"]
-    GRIDAVAIL --> CLAMP["clamp to breaker -> slew +-1A/s -> clamp to main breaker"]
+    GRIDAVAIL --> CLAMP["clamp to breaker -> slew +-1A/s -> clamp to main breaker -> floor to whole amp"]
     AGGAVAIL --> CLAMP
     PERPHASEAVAIL --> CLAMP
     CLAMP --> CARCHARGE{"car_charging?<br/>contactor closed AND vehicle&ge;2A"}
     CARCHARGE -- "YES, drawing" --> ORAWCAR["o_raw = worst + (breaker - desired_avail)<br/>1:1 correlation with TWC's ramp"]
     CARCHARGE -- "NO, idle" --> ORAWIDLE["o_raw = breaker - desired_avail<br/>direct budget, no worst"]
-    ORAWCAR --> ZONECHECK{"zone steering engaged?"}
-    ORAWIDLE --> ZONECHECK
-    ZONECHECK -- "YES" --> ZONE["Zone Steering block (see #2)<br/>overrides pub with a discrete band"]
-    ZONECHECK -- "NO" --> PUBCHECK{"o_raw &le; breaker?"}
+    ORAWCAR --> ENGAGE{"multi-phase engagement?<br/>charging, not all 3 phases up yet,<br/>over-limit not yet confirmed"}
+    ORAWIDLE --> ENGAGE
+    ENGAGE -- "YES" --> PERPHASE["Per-phase asymmetric publish (see #5)<br/>bypasses the symmetric law entirely"]
+    ENGAGE -- "NO" --> ZONECHECK{"zone steering engaged?"}
+    ZONECHECK -- "YES" --> ZONE["Zone Steering block (see #11)<br/>overrides pub with a discrete band"]
+    ZONECHECK -- "NO" --> NEARMIN{"ramp_complete AND near own<br/>minimum AND unconfirmed over-limit?"}
+    NEARMIN -- "YES" --> GENTLEHOLD["pub = breaker + 0.3A (see #6)<br/>ride it out, can't throttle lower"]
+    NEARMIN -- "NO" --> PUBCHECK{"o_raw &le; breaker?"}
     PUBCHECK -- "YES" --> PUBLOW["pub = max(o_raw, 0)"]
     PUBCHECK -- "NO, over limit" --> PUBEXCESS["pub = breaker + clamp(0.75*excess, 1.1, 1.2)"]
     ZONE --> HOLD{"still in post-correction<br/>hold window (60s)?"}
+    GENTLEHOLD --> HOLD
     PUBLOW --> HOLD
     PUBEXCESS --> HOLD
     HOLD -- "YES" --> HOLDFLOOR["pub = max(pub, breaker,<br/>(car_charging?worst:0) + hold_bias)"]
     HOLD -- "NO" --> DITHER["pub += +-0.05A dither"]
     HOLDFLOOR --> DITHER
-    DITHER --> PUBLISH(["reported_a=b=c = pub -> Modbus 0xF4-0xF8"])
+    PERPHASE --> DITHER
+    DITHER --> PUBLISH(["reported_a/b/c -> Modbus 0xF4-0xF8<br/>(symmetric, except the per-phase branch)"])
 
     classDef disabled fill:#8592a333,stroke:#8592a3,color:#8592a3
     classDef failsafe fill:#c23a5233,stroke:#c23a52,color:#c23a52
@@ -60,7 +66,9 @@ flowchart TD
     class AGGAVAIL agg
     class PERPHASEAVAIL perphase
     class HOLDFLOOR hold
+    class GENTLEHOLD hold
     class ZONE zone
+    class PERPHASE perphase
 ```
 
 ## 2. Entry conditions
@@ -81,7 +89,7 @@ Two guards ahead of any computation, shared by every mode.
 
 Three independent paths to `desired_avail` — how much the car is
 allowed to take — before any shared post-processing (slew, main
-breaker).
+breaker, floor).
 
 **GRID mode** (`charge_from_grid = true`): household balance is
 ignored entirely — the car gets the maximum either breaker allows.
@@ -93,6 +101,17 @@ billing — average of the household-only signal.
 `desired_avail = ((-household_a + offset) + (-household_b + offset) + (-household_c + offset)) / 3`.
 Live-verified example: real A/B/C 8.71/8.00/8.53A, household A/B/C
 −8.00/−8.00/−8.20A → `desired_avail = 7.85A`.
+
+**Caveat, confirmed live**: averaging masks a single badly-imbalanced
+phase. A ~2.2kW single-phase load (a water heater) sitting almost
+entirely on one leg (household A/B/C ≈ 1.1/0.8/9.0A) still let AGG
+mode compute a comfortable-looking `desired_avail ≈ 8A` — but `worst`
+(§4) picks up that same loaded phase's *raw* current directly, so
+`o_raw` stayed persistently over the limit the whole time regardless
+of what the averaged budget promised. AGG's softening only ever
+applies to the budget term, never to the correlation term — see §4.
+Per-phase metering doesn't have this blind spot (the tight phase
+*is* the budget, via `min`).
 
 **FVE · per-phase metering** (default, `aggregate_balance_metering =
 OFF`): the utility settles each phase separately — the weakest
@@ -112,7 +131,19 @@ Common post-processing across all three branches:
 desired_avail = min(desired_avail, breaker)                                   // ceiling
 desired_avail = slew(desired_avail, up 10A/s / down 1A/s)                     // NaN-bypass on the first cycle after boot
 desired_avail = min(desired_avail, main_breaker − max(real_a, real_b, real_c)) // main breaker, immediate, never delayed
+desired_avail = floor(desired_avail)                                          // whole amp, never rounds UP
 ```
+
+**Why floor**: requested explicitly, confirmed live. A fractional
+budget (e.g. `8.33A`, from `fve_offset=6kW` minus a small household
+baseline) still let the app/TWC3 present a rounded-*up* whole-amp max
+(`9A`) to the driver. The car then actually drew `9A × 3 × 230V =
+6210W` — already 210W over the 6kW offset on its own, before even
+adding the household's own load back in. `floorf()` only ever makes
+the published budget *more* conservative (rounds toward less
+availability, including for negative/deficit values) — the same
+never-overshoot-reality principle already used for `signed_x` on the
+export side, just applied to the budget itself.
 
 ## 4. Publication law — `car_charging` decides correlation
 
@@ -145,31 +176,136 @@ unshifted value during a real ramp = loss of trust in the meter.
 Live-verified (6kW export): `worst (vehicle drawing) = 8.20A`,
 `bias_offset = 20 − 7.85 = 12.15A`, `o_raw (car_charging=1) = 4.15A`.
 
-**Final `pub` value:**
+**Important**: `worst` is deliberately never adjusted by `fve_offset`
+— the offset only shifts `desired_avail` (§3). `worst` has to track
+TWC3's own measured current 1:1 for the correlation check to mean
+anything; folding an artificial offset into it would make `reported`
+diverge from physical reality, which is exactly the distrust/abort
+risk this whole design exists to avoid (see §3's AGG caveat for what
+happens when `worst` and the budget genuinely disagree).
+
+**Final `pub` value** (once past the engagement-window and near-limit
+gates in §5/§6):
 
 ```
 o_raw <= breaker:  pub = max(o_raw, 0)                       // floored at 0, never negative
 o_raw >  breaker:  excess = clamp(0.75 * (o_raw - breaker), 1.1, 1.2)
-                    pub = breaker + excess                    // 1.1A floor, not 0.1 — see §8
+                    pub = breaker + excess                    // 1.1A floor, not 0.1 — see §9
 ```
 
-## 5. Post-correction hold — anti-oscillation
+## 5. Multi-phase engagement — per-phase asymmetric publishing
+
+A 3-phase Tesla session doesn't engage all 3 phases at once — it pours
+its whole draw onto L1 for the first several seconds, ramping toward
+target, before L2/L3 pick up (and the vitals API's 2s poll lag leaves
+`twc_vitals_current_b/c` reading ~0 even longer). The symmetric
+publication law stamps the *same* `worst + bias_offset` onto all 3
+registers — so with only L1 drawing, `worst` is that one phase and
+`reported` saturates at/near the limit on L2/L3 too, even though
+they're carrying nothing. TWC3 then sees no per-phase headroom to
+bring L2/L3 up and won't engage them.
+
+```mermaid
+flowchart TD
+    A["car_charging AND NOT all 3 phases &ge;2A<br/>AND over-limit not yet confirmed (§6)"] --> B["startup_bringup = true"]
+    B --> C["rep_x = clamp(corr_x + bias_offset, 0, breaker)<br/>computed PER PHASE, independently"]
+    C --> D{"is this phase already loaded?"}
+    D -- "YES (corr_x high)" --> E["rep_x saturates at breaker<br/>-> TWC3's 'hold, don't ramp further'"]
+    D -- "NO (corr_x still negative, exporting)" --> F["rep_x reads well under breaker<br/>-> TWC3's 'connect and ramp' signal"]
+    E --> G(["reported_a/b/c published<br/>independently, NOT symmetric"])
+    F --> G
+    G --> H{"all 3 phases now &ge;2A?"}
+    H -- "YES" --> I["ramp_complete -> symmetric law resumes (§4)"]
+    H -- "NO" --> A
+```
+
+**Confirmed live (bug, now fixed)**: with `worst=5.9A` (L1 only) and a
+low FVE `desired_avail` (~5.9A, because L3 had almost no household
+load so the aggregate average was dragged down toward the car's own
+minimum), `reported` saturated at ~20A on L2/L3 too. TWC3 held the car
+pinned at its ~6A minimum, never let it bring the other phases up, and
+the session aborted within ~3s — every single attempt. GRID mode
+(`bias_offset=0` → `reported≈12A`) engaged all 3 phases and ramped
+fine in the same conditions, which was the tell.
+
+**The fix**: each phase gets its own value —
+`reported_x = clamp(corr_x + bias_offset, 0, twc_breaker)`, computed
+independently per phase instead of from the shared `worst`/`pub`. A
+loaded phase parks at the budget (hold); an idle phase reads a real
+"connect" signal. As each phase joins, its `corr_x` rises and its
+`reported` converges upward toward the same value; once all 3 carry
+current (`ramp_complete`), the symmetric law resumes with everything
+already sitting near the budget instead of one phase having
+over-ramped alone.
+
+This is the one deliberate exception to the otherwise-symmetric
+publication law — see §1's flowchart, where this branch bypasses the
+zone-steering/near-limit/excess logic entirely and publishes directly.
+
+## 6. Near-limit handoff — `over_limit_confirmed` and the minimum-current hold
+
+"Over the limit" is not treated as a real correction until it has been
+**sustained**. `zone_over_limit_since_ms` tracks how long `o_raw` has
+been over `twc_breaker` continuously while charging; `over_limit_confirmed`
+is true once that has held for `number.*_zone_steering_engage_delay`
+(default 30s). This single timer now gates three different things:
+
+1. **Multi-phase engagement** (§5) only applies while `!over_limit_confirmed`
+   — a 30s+ sustained excess is treated as real even before all 3
+   phases are up.
+2. **The classic law's `law_nudge_min_a` floor** (§4's final `pub`
+   formula) only applies once `over_limit_confirmed` — see below for
+   what happens before that.
+3. **Zone steering's entry latch** (§11) engages on `over_limit_confirmed`
+   OR immediately on `ramp_complete && o_raw > breaker` (see below).
+
+**Ramp-complete handoff to zone steering, immediate**: once all 3
+phases are established, a marginal over-limit hands off to zone
+steering's actual-vs-target tolerance *immediately*, without waiting
+the 30s confirm. Confirmed live: a fully-ramped 3-phase session
+(~9.9A/phase, nowhere near the car's minimum) had `o_raw` tick over
+the limit by a trivial ~0.2-0.7A — `actual` was essentially *at*
+`target`, well within zone steering's own tolerance (its HOLD band,
++0.2A) — but the classic law's `law_nudge_min_a` floor doesn't grade
+by how large the excess actually is, so it slammed `pub` straight to
+`breaker+1.1A` (the confirmed-fast-cascade band, §9). `o_raw` recovered
+under the limit less than a second later (the car had already backed
+off on its own) but the cascade was already committed — the session
+dropped out anyway, matching the documented "recovery doesn't stop an
+in-progress cascade" finding (§9). Zone steering's tolerance/HOLD band
+rides this out gently instead.
+
+**Near-minimum gentle hold** (fallback, when zone steering is off or
+hasn't engaged): if the car is fully ramped (`ramp_complete`) and
+sitting within 2A of `min_charge_current_a` (its own practical floor),
+an unconfirmed over-limit publishes `pub = breaker + 0.3A` — TWC3's
+no-reaction band — instead of the classic law's `law_nudge_min_a`
+floor. Confirmed live: the car cannot throttle down any further
+without dropping out entirely, so a brief dip is ridden out (waiting
+for the surplus to recover, or for `over_limit_confirmed` to make it a
+real, sustained deficit) rather than forced into a stop.
+
+## 7. Post-correction hold — anti-oscillation
 
 Without this mechanism, `pub` immediately fell back after a
 correction, the car ramped straight back up, and the contactor cycled
 in a ~1-2s loop. The hold keeps `pub` at the limit for 60 seconds after
 the last correction — but **correlation-safe**, tracking `worst` in
-real time rather than as a flat constant.
+real time rather than as a flat constant. Only a **confirmed**
+over-limit (§6) arms it — a 1-3s engagement-window artifact never
+pushes `pub` past its own gentle bands, so there's nothing to hold
+back from.
 
 ```mermaid
 flowchart TD
-    A{"o_raw > breaker<br/>(correction needed right now)?"} -- "YES" --> B["hold_until = now + 60s<br/>hold_bias = bias_offset (frozen at first)"]
+    A{"o_raw > breaker AND<br/>over_limit_confirmed?"} -- "YES" --> B["hold_until = now + 60s<br/>hold_bias = bias_offset (frozen at first)"]
     A -- "NO" --> C{"still inside a hold window<br/>from an earlier correction?"}
     B --> C
     C -- "YES" --> D["floor = max(breaker,<br/>(car_charging?worst:0) + hold_bias)"]
     C -- "NO" --> E(["pub no longer touched"])
     D --> F["pub = max(pub, floor)"]
     F --> E
+    Z["contactor opens"] -.->|"clears immediately"| B
     classDef hold fill:#6f5bc933,stroke:#6f5bc9,color:#6f5bc9
     class D hold
     class F hold
@@ -191,7 +327,14 @@ natural value — no further rate-limiter on top (the original
 `0.1A/s` crawl was removed: maximizes surplus use, the hold alone is
 enough to stop contactor cycling).
 
-## 6. Grace period and escalation
+**Cleared immediately on contactor-open**: requested explicitly,
+confirmed live — `reported` used to sit pinned at `twc_breaker` for up
+to a minute after a session had *already ended* (the hold has nothing
+left to hold back once the charging circuit itself is open). The hold
+now clears the instant `twc_vitals_contactor_closed` goes false,
+instead of waiting for the 60s window to expire on its own.
+
+## 8. Grace period and escalation
 
 A secondary safety net beyond the publication law — what to do when a
 deficit persists. Grace never touches `o_raw`/`pub` directly (that
@@ -225,6 +368,10 @@ regulation entirely, the car kept drawing from the grid with no
 downward pressure. **Fix**: grace never touches `o_raw`/`pub` — it only
 suppresses escalation (both stages) once `vitals_vehicle ≤ 7A` (raised
 from an original 5.5A, since the real measured minimum was ~6A).
+Escalation is also suppressed entirely during `startup_bringup` (§5) —
+forcing all 3 registers up would defeat the per-phase headroom signal
+that's deliberately holding the loaded phase at the budget while the
+others connect.
 
 **Stage 1 / Stage 2**: `capped_since_ms` runs continuously from the
 first moment `o_raw > breaker` — the grace timer doesn't restart it,
@@ -235,7 +382,7 @@ only skips the actual forcing.
 | Stage 1 (2 min) | over limit continuously | `reported >= breaker + 1.1A` |
 | Stage 2 (4 min) | still over limit | `reported >= breaker + 1.5A` |
 
-## 7. Input filters (outside `recompute_ct`)
+## 9. Input filters (outside `recompute_ct`)
 
 Run before the main logic, in the Shelly sensors' `on_value` handlers.
 
@@ -246,7 +393,7 @@ Run before the main logic, in the Shelly sensors' `on_value` handlers.
   `corr_x = max(signed_x, vitals_current_x)`. Applied only to the
   correlation signal, never to `household_x` (see §4).
 
-## 8. Threshold-probe: TWC3's measured reaction curve
+## 10. Threshold-probe: TWC3's measured reaction curve
 
 Branch `test/threshold-probe` adds a manual switch
 (`switch.*_threshold_test_mode`) and a number field
@@ -295,34 +442,37 @@ before the floor.
 declining to a full stop regardless. Only fully turning `threshold_test_mode`
 **off** (returning to the natural, low published value) let the car
 recover from a partial drop (e.g. 6A) instead of continuing to a full
-stop.
+stop. This "a cascade doesn't stop on its own once triggered" finding
+is exactly what §6's immediate ramp-complete handoff and §5's
+per-phase publishing are built to avoid triggering in the first place.
 
-**Practical implication — the motivation for Zone Steering (§9)**:
+**Practical implication — the motivation for Zone Steering (§11)**:
 there is no single excess value that's simultaneously "fast enough to
 react to a real deficit" and "gentle enough to never overshoot into a
 stop." Instead of one continuous value: a sequence of discrete bands,
 plus escalation driven by elapsed time, not just by the size of the
 excess.
 
-## 9. Zone Steering — discrete bands for graceful de-escalation
+## 11. Zone Steering — discrete bands for graceful de-escalation
 
 Branch `test/zone-steering` (merged into `dev` and `master`) — instead
 of one continuous `excess` value (§4), publishes one of 4 discrete
 bands relative to `twc_breaker_limit_a`, chosen by comparing the
 vehicle's **actual** current (`twc_vitals_vehicle_current`) against
-`desired_avail` (the target). Only engages when the classic law would
-already be publishing at/above the limit while charging.
+`desired_avail` (the target). Only engages once §6's conditions are
+met (a confirmed sustained deficit, or an immediate ramp-complete
+handoff).
 
 TWC3's own live plausibility/correlation check on `reported` (comparing
 it against its own ramping current, see §4) appears to only really be
 active during the initial charging ramp-up. Once the limit is reached
 and zone steering takes over, that check doesn't seem to be a factor
 anymore — behavior at that point is driven purely by the reaction-curve
-timing in §8. Not confirmed as a hard rule yet, but consistent with
+timing in §10. Not confirmed as a hard rule yet, but consistent with
 everything observed so far, and part of why zone steering can safely
 hold a fixed band value for multiple seconds at a time without
 triggering a correlation-distrust stop the way a static value would
-during ramp-up (§5).
+during ramp-up (§5) — **with one exception, see INCREASE below.**
 
 ```mermaid
 flowchart TD
@@ -333,27 +483,61 @@ flowchart TD
     E -- "NO" --> I{"actual > target + tolerance?"}
     I -- "YES" --> J["SLOW<br/>pub = breaker + effective_excess"]
     I -- "NO" --> K{"actual < target - tolerance<br/>AND past recovery_hold?"}
-    K -- "YES" --> L["INCREASE<br/>pub = breaker - 1.0A"]
+    K -- "YES" --> L["INCREASE: handoff to natural law<br/>engaged=false, worst-tracking resumes"]
     K -- "NO" --> M["HOLD<br/>pub = breaker + 0.2A"]
     H --> N["min-dwell gate<br/>(asymmetric, decreases instant)"]
     J --> N
-    L --> N
     M --> N
     N --> O(["pub -> Modbus"])
+    L --> O
     classDef floor fill:#2f8f5233,stroke:#2f8f52,color:#2f8f52
     classDef hard fill:#c23a5233,stroke:#c23a52,color:#c23a52
     classDef slow fill:#c9752233,stroke:#c97522,color:#c97522
     classDef hold fill:#6f5bc933,stroke:#6f5bc9,color:#6f5bc9
-    class G floor
+    class G,L floor
     class H,J hard
-    class L,M hold
+    class M hold
 ```
 
-**Auto-engage / latch**: engages the instant the classic computation
-would have published `>= twc_breaker_limit_a` while charging — not
-tied to a manual switch or timing. Stays engaged through normal
-fluctuation; disengages only on `FLOOR_REACHED` handoff or
-`!car_charging`; re-engages fresh on the next threshold hit.
+**Auto-engage / latch**: engages either once the classic computation
+has been publishing `>= twc_breaker_limit_a` **continuously for
+`zone_steering_engage_delay_s` (default 30s)** while charging, **or**
+immediately once all 3 phases are established (`ramp_complete`) and
+`o_raw` is over the limit at all — see §6 for why the immediate path
+exists. Not tied to a manual switch. Stays engaged through normal
+fluctuation (SLOW/DESCEND_TO_FLOOR/HOLD); disengages on `FLOOR_REACHED`
+handoff, **INCREASE handoff (see below)**, `!car_charging`, a GRID↔FVE
+transition, or `switch.*_zone_steering_mode` being turned off (an
+active latch drops immediately, not at the next `!car_charging`);
+re-engages fresh on the next threshold hit.
+
+**Why the delay path still exists**: a 3-phase Tesla session doesn't
+engage all 3 phases at once — it pours its whole draw onto L1 for the
+first several seconds, ramping toward target, before L2/L3 pick up.
+§5 now handles that window with per-phase publishing instead of
+letting zone steering see the transient at all; the 30s confirm is the
+fallback for a genuine sustained deficit that's independent of
+engagement (e.g. the AGG-averaging blind spot in §3).
+
+**INCREASE hands off to the natural law instead of holding flat**:
+requested explicitly, confirmed live (bug, now fixed). This band used
+to publish a flat `breaker-1.0A` value whenever `actual` was clearly
+below `target`. Live-confirmed: holding that static number for 15-20+
+seconds while the car's own actual current was genuinely fluctuating
+(several ramp-up attempts) is exactly the kind of static-value
+distrust-latch risk this file's own dither mechanism exists to avoid
+elsewhere — and a session dropped out with `reported` sitting
+comfortably under the limit the whole time, nothing in the published
+signal explaining the stop. Fix: `actual` clearly below `target` (by
+more than `tol`) means `worst` is below `desired_avail` by more than
+`tol` too, so `o_raw = worst + bias_offset` is provably under
+`twc_breaker` in this branch — hand off to the natural, worst-tracking
+computation (§4) instead of a static number, and only re-engage zone
+steering if a real braking need reappears. **HOLD stays zone-steering-owned**
+(unlike INCREASE) — disengaging there would reintroduce the exact
+knife-edge cascade §6 fixes: `actual≈target` means `o_raw` sits right
+at `breaker`, and the natural law's `law_nudge_min_a` floor has no
+graduated response to a trivial crossing.
 
 **Floor + immediate handoff**: the original design had a separate
 FLOOR_HOLD state with its own grace timer. Live-confirmed: `actual`
@@ -387,7 +571,7 @@ the last **published** value sticky for at least `zone_steering_min_dwell_s`
 Asymmetric: a decrease (easing off) is always accepted instantly,
 matching the "rises trusted immediately, only firming up needs
 caution" pattern used throughout this design (anti-glitch firewall, R1
-floor, the release logic in §5) — only an *increase* in severity is
+floor, the release logic in §7) — only an *increase* in severity is
 dwell-gated.
 
 **Recovery-hold cooldown**: blocks INCREASE for
@@ -408,8 +592,9 @@ an immediate ramp back up, undoing the correction just made.
 | `zone_steering_recovery_hold_s` | 10 s | blocks INCREASE right after braking |
 | `zone_steering_min_dwell_s` | 3 s | minimum time between pub escalations (asymmetric) |
 | `zone_steering_stuck_timeout_s` | 60 s (5-900) | escalates to +1.1A when no progress is made |
+| `zone_steering_engage_delay_s` | 30 s (0-180) | `o_raw` must sit over the limit this long before the *delayed* latch path engages (§6) — the ramp-complete path is immediate |
 
-## 10. Constants reference
+## 12. Constants reference
 
 | constant | value | note |
 |---|---|---|
@@ -417,11 +602,11 @@ an immediate ramp back up, undoing the correction just made.
 | `main_breaker_limit_a` | 25.0 A | physical main breaker, clamped instantly |
 | `excess_gain` | 0.75 | compression of the over-limit excess |
 | `excess_max_a` | 1.2 A | compression ceiling |
-| `law_nudge_min_a` | 1.1 A | raised from 0.1 — confirmed TWC3 reaction margin |
+| `law_nudge_min_a` | 1.1 A | raised from 0.1 — confirmed TWC3 reaction margin; only applied once `over_limit_confirmed` (§6) |
 | `desired_avail_slew_down_a_per_s` | 1.0 A/s | decline throttled (protective) |
 | `desired_avail_slew_up_a_per_s` | 10.0 A/s | recovery treated as instant/protective |
-| `post_correction_hold_ms` | 60,000 ms | 1 minute, worst-tracking floor |
-| `grace_vitals_threshold_a` | 7.0 A | "car near minimum" detection |
+| `post_correction_hold_ms` | 60,000 ms | 1 minute, worst-tracking floor; cleared immediately on contactor-open (§7) |
+| `grace_vitals_threshold_a` | 7.0 A | "car near minimum" detection (grace period, §8) |
 | `number.*_low_surplus_grace_period` | 12 s (default, HA) | runtime-adjustable |
 | `escalation_timeout_ms` | 120,000 ms | stage 1 at 2×, stage 2 at 4× |
 | `escalation_kick_a` | 1.5 A | stage 2 hard kick |
@@ -429,6 +614,8 @@ an immediate ramp back up, undoing the correction just made.
 | `glitch_drop_a` / `confirm_tol_a` | 3.0 A / 1.0 A | anti-glitch firewall |
 | `shelly_unavailable_debounce_ms` | 10,000 ms | before fail-safe |
 | `car_charging` threshold | `vehicle_current` ≥ 2.0 A | + contactor closed |
+| `ramp_complete` threshold | all 3 `vitals_current_x` ≥ 2.0 A | + `car_charging` (§5/§6) |
+| `min_charge_current_a` + 2A | ≤ this = "near own minimum" | gates the gentle hold in §6 |
 
 ---
 *esphome-twc-control · `recompute_ct` decision tree · source: `twc-control.yaml`, branch `master`*
